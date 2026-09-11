@@ -1,0 +1,11 @@
+# Never commit real credentials or generated migration artifacts
+config/config.env
+audit-*/
+*.log
+*.pem
+*.key
+!config/config.example.env
+
+# OS/editor noise
+.DS_Store
+*.swp

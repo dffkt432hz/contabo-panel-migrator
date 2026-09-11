@@ -1,0 +1,12 @@
+#!/usr/bin/env bash
+# Mock ssh: strip option flags and userhost, run the remaining command locally.
+args=()
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    -p|-i|-o) shift 2 ;;
+    -*) shift ;;
+    *) args=("$@"); break ;;
+  esac
+done
+shift  # drop user@host (first of args)
+exec bash -c "${args[*]:1}"
