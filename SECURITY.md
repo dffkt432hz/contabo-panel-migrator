@@ -28,6 +28,14 @@ immediately; deleting the post does not un-leak it.
   `audit-<timestamp>/generated-passwords.tsv` with mode `600` inside a `700`
   directory. Move them to a password manager and delete the directory when
   you are done.
+- **Secrets on command lines.** Database passwords are sent to `mysql` on
+  stdin and to the connection test through `MYSQL_PWD`, so they are not part
+  of any process argument list. Two things still are, briefly, for the
+  moment the command runs: a mailbox's password *hash* (as an argument to
+  `virtualmin create-user --encpass`) and the Contabo credentials (as
+  `curl` arguments on the machine running the wizard). Run the wizard on a
+  machine, and against servers, where no untrusted user can read the
+  process list.
 - **SSH.** Host keys are accepted on first use (`StrictHostKeyChecking=accept-new`)
   and every remote command is fully scripted. File transfers are relayed
   through the machine running the wizard, so the source and target servers

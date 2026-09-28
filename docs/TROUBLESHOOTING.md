@@ -141,6 +141,27 @@ The schema-level default charset has been observed to disagree with the
 `mysqldump --default-character-set=...` value — guessing wrong silently
 corrupts non-ASCII text (diacritics, emoji, etc.) on import with no error.
 
+**Non-ASCII text (Romanian ă ș ț, for example) turned into `?` after import.**
+This is what happens when a database is dumped with a client character set
+that cannot represent the data — classically a `utf8` database dumped as
+`latin1`. The toolkit now reads the real charset of every table and picks
+the dump charset from that: the tables' own charset when there is exactly
+one (so byte-exact copies stay byte-exact), otherwise `utf8mb4`, and never
+`latin1` for anything that is not `latin1`. If you migrated with 1.0.0 or
+1.0.1, re-import affected databases with the current version.
+
+**`Failed to create DB user` for a password with a quote or backslash.**
+Fixed in 1.0.2: the user's SQL is now escaped and sent over stdin, so the
+password arrives byte-for-byte. Re-running a migration also corrects a user
+left behind with the wrong password. A site whose config yields *no*
+password gets no MySQL user at all (never a passwordless one) — create it by
+hand and re-run the sanity check.
+
+**The migration warns that the account owns other databases.**
+Only the database named in the app's config is migrated automatically. Other
+databases with the account's `<user>_` prefix are listed, with the command to
+migrate each one (`migrate_one_database`).
+
 **Row counts don't match after import.**
 Never use `information_schema.tables.table_rows` to verify — it's an
 *estimate* for InnoDB and has been observed stale immediately post-import.
@@ -241,8 +262,12 @@ an authentication error.
 stops receiving mail after DNS cutover.**
 Its SPF record almost certainly had an `include:` mechanism that got
 blindly overwritten. `contabo_dns_upsert_spf()` in `lib/contabo-api.sh`
-always preserves existing `include:` entries and only swaps the `ip4:`
-mechanism — never hand-roll a full SPF replacement.
+finds the real SPF record by its content and updates it in place,
+*adding* the new server and keeping every existing mechanism and the
+domain's own `-all`/`~all` policy (a record that uses `redirect=` is left
+unchanged, with a warning). The old server's `ip4:` entry is kept too, so
+remove it by hand once the source is decommissioned. Never hand-roll a
+full SPF replacement.
 
 **`www` stops resolving after cutover.**
 If `www.<domain>` was a CNAME and the cutover created an A record for the
@@ -250,6 +275,14 @@ same name, the zone now contains both — which is invalid, and resolvers
 handle it unpredictably. `dns_cutover_domain()` checks for an existing
 CNAME first and leaves it alone (a CNAME to the apex follows the apex
 automatically, so it needs no update).
+
+**The DNS cutover stops with "Could not read the DNS zone".**
+The zone must be readable at Contabo before anything is written. If the
+domain's nameservers are not Contabo's, its zone lives at another provider
+(Cloudflare, the registrar...) and the records have to be changed there;
+writing into an unused Contabo zone would "succeed" while changing nothing.
+The cutover also refuses a target that is not an IPv4 address — give it the
+server's public IPv4, not a hostname.
 
 **A site's homepage disappears after migration.**
 Virtualmin's `create-domain` drops a placeholder `index.html` into

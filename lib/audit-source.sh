@@ -123,21 +123,18 @@ source_php_versions() {
 # Distinct real character sets across a database's tables — per-table
 # collation, deliberately NOT the schema default (see TROUBLESHOOTING.md).
 source_db_charsets() {
-  local db="$1"
-  [[ "$db" =~ ^[A-Za-z0-9_]+$ ]] || return 0
-  c_ssh source "mysql -N -B -e \"SELECT DISTINCT c.character_set_name FROM information_schema.tables t JOIN information_schema.collation_character_set_applicability c ON c.collation_name = t.table_collation WHERE t.table_schema='${db}' AND t.table_type='BASE TABLE';\" 2>/dev/null" \
-    | tr '\n' ' ' | sed 's/ *$//'
+  db_charsets source "$1"
 }
 
 source_db_exists() {
   local db="$1"
-  [[ "$db" =~ ^[A-Za-z0-9_]+$ ]] || return 1
-  [[ -n "$(c_ssh source "mysql -N -B -e \"SHOW DATABASES LIKE '${db}';\" 2>/dev/null" | tr -d '[:space:]')" ]]
+  [[ "$db" =~ ^[A-Za-z0-9_-]+$ ]] || return 1
+  [[ -n "$(c_ssh source "mysql -N -B -e \"SELECT SCHEMA_NAME FROM information_schema.SCHEMATA WHERE SCHEMA_NAME='${db}';\" 2>/dev/null" | tr -d '[:space:]')" ]]
 }
 
 source_db_size_kb() {
   local db="$1" kb
-  [[ "$db" =~ ^[A-Za-z0-9_]+$ ]] || { echo 0; return 0; }
+  [[ "$db" =~ ^[A-Za-z0-9_-]+$ ]] || { echo 0; return 0; }
   kb=$(c_ssh source "mysql -N -B -e \"SELECT COALESCE(ROUND(SUM(data_length+index_length)/1024),0) FROM information_schema.tables WHERE table_schema='${db}';\" 2>/dev/null" | tr -d '[:space:]')
   [[ "$kb" =~ ^[0-9]+$ ]] || kb=0
   echo "$kb"
@@ -205,14 +202,29 @@ audit_source_accounts() {
     creds=""
     charset=""
     dbkb=0
+    local all_dbs others pdb
+    all_dbs=$(account_prefixed_dbs source "$user")
     if [[ -n "$db" ]]; then
       if source_db_exists "$db"; then
         charset=$(source_db_charsets "$db")
         dbkb=$(source_db_size_kb "$db")
+        others=$(printf '%s\n' "$all_dbs" | grep -vxF "$db" | grep -v '^$' | tr '\n' ' ' || true)
+        if [[ -n "${others// /}" ]]; then
+          warn "      Other databases owned by this account (NOT migrated by the pipeline): ${others}"
+        fi
       else
         warn "      The app references database '${db}' but it does not exist on the source."
         warn "      The migration will skip it rather than invent an empty one."
       fi
+    elif [[ -n "$all_dbs" ]]; then
+      # No app config found: the migration falls back to the prefix match, so
+      # size and report exactly those databases.
+      db=$(printf '%s\n' "$all_dbs" | grep -v '^$' | tr '\n' ',' | sed 's/,$//')
+      while IFS= read -r pdb; do
+        [[ -z "$pdb" ]] && continue
+        dbkb=$((dbkb + $(source_db_size_kb "$pdb")))
+      done <<< "$all_dbs"
+      warn "      No app config found; the migration will use the prefix match: ${db}"
     fi
 
     mail_count=$(detect_mailboxes "$user" | grep -c '@' || true)

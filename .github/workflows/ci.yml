@@ -30,4 +30,4 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: ShellCheck (warnings and above)
-        run: shellcheck -x -S warning -e SC1090,SC1091 bin/*.sh lib/*.sh tests/run-tests.sh tests/mock-ssh/ssh
+        run: shellcheck -x -S warning -e SC1090,SC1091 bin/*.sh lib/*.sh tests/run-tests.sh tests/mock-ssh/ssh tests/mock-ssh/mysql

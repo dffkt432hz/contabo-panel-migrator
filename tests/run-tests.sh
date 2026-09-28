@@ -31,6 +31,8 @@ source "$REPO_ROOT/lib/audit-source.sh"
 source "$REPO_ROOT/lib/audit-target.sh"
 # shellcheck source=../lib/migrate-account.sh
 source "$REPO_ROOT/lib/migrate-account.sh"
+# shellcheck source=../lib/dns-cutover.sh
+source "$REPO_ROOT/lib/dns-cutover.sh"
 # shellcheck source=../lib/sanity-check.sh
 source "$REPO_ROOT/lib/sanity-check.sh"
 
@@ -301,8 +303,8 @@ check "higher target limits pass (never asks to lower anything)" \
   "$( ( php_limits_of() { printf 'memory_limit=2G\nupload_max_filesize=1G\nmax_execution_time=0\n'; }; check_php_parity >/dev/null 2>&1; echo $? ) )" "0"
 check "unlimited (-1) on the target passes" \
   "$( ( php_limits_of() { printf 'memory_limit=-1\nupload_max_filesize=128M\nmax_execution_time=300\n'; }; check_php_parity >/dev/null 2>&1; echo $? ) )" "0"
-check "an unreadable target is a failure, not a silent pass" \
-  "$( ( php_limits_of() { :; }; check_php_parity >/dev/null 2>&1; echo $? ) )" "1"
+check "an unreadable target is reported as 'cannot check' (2), not a pass or a gap" \
+  "$( ( php_limits_of() { :; }; check_php_parity >/dev/null 2>&1; echo $? ) )" "2"
 
 mkdir -p "$TMP/phpd/a" "$TMP/phpd/b"
 DROP="$TMP/phpd/a/${TARGET_PHP_INI_NAME}"
@@ -323,6 +325,184 @@ check "fix refuses to run with no recorded source limits" \
   "$( ( AUDIT_DIR="$TMP/empty-audit"; mkdir -p "$AUDIT_DIR"; fix_php_parity >/dev/null 2>&1; echo $? ) )" "1"
 check "fix reports failure when no PHP config directory exists" \
   "$( ( export TARGET_PHP_INI_DIRS="$TMP/nowhere/*"; php_limits_of() { printf 'memory_limit=128M\n'; }; fix_php_parity >/dev/null 2>&1; echo $? ) )" "1"
+
+
+# ---------------------------------------------------------------------------
+group "IPv4 validation (DNS needs an address, not a hostname)"
+check "real address accepted"            "$(is_ipv4 203.0.113.9 && echo yes || echo no)" "yes"
+check "hostname rejected"                "$(is_ipv4 vmi123.contaboserver.net && echo yes || echo no)" "no"
+check "octet over 255 rejected"          "$(is_ipv4 "$((299 + 1)).1.1.1" && echo yes || echo no)" "no"
+check "too few octets rejected"          "$(is_ipv4 1.2.3 && echo yes || echo no)" "no"
+check "empty rejected"                   "$(is_ipv4 '' && echo yes || echo no)" "no"
+
+# ---------------------------------------------------------------------------
+group "SPF: add this server, keep everything the domain already authorized"
+check "no record -> conservative default" "$(spf_rewrite '' 203.0.113.9)" "v=spf1 +mx +a +ip4:203.0.113.9 ~all"
+check "include: kept, server added" \
+  "$(spf_rewrite 'v=spf1 include:zoho.eu ~all' 203.0.113.9)" "v=spf1 include:zoho.eu +ip4:203.0.113.9 ~all"
+check "mx/a/other ip4/include all kept, and the -all policy is NOT loosened to ~all" \
+  "$(spf_rewrite 'v=spf1 mx a ip4:198.51.100.7 include:_spf.google.com -all' 203.0.113.9)" \
+  "v=spf1 mx a ip4:198.51.100.7 include:_spf.google.com +ip4:203.0.113.9 -all"
+check "redirect= record is returned untouched" \
+  "$(spf_rewrite 'v=spf1 redirect=_spf.example.net' 203.0.113.9)" "v=spf1 redirect=_spf.example.net"
+check "already authorized -> unchanged, no duplicate ip4" \
+  "$(spf_rewrite 'v=spf1 +ip4:203.0.113.9 ~all' 203.0.113.9)" "v=spf1 +ip4:203.0.113.9 ~all"
+
+# ---------------------------------------------------------------------------
+group "Contabo DNS: real error handling, against a fake API"
+CURL_LOG="$TMP/curl.log"
+DNS_RECORDS='{"data":[
+ {"recordId":22,"name":"example.com","type":"TXT","data":"google-site-verification=abc","ttl":3600,"prio":0},
+ {"recordId":21,"name":"example.com","type":"TXT","data":"v=spf1 include:zoho.eu ~all","ttl":300,"prio":0},
+ {"recordId":11,"name":"example.com","type":"A","data":"198.51.100.7","ttl":600,"prio":0},
+ {"recordId":12,"name":"www.example.com","type":"A","data":"198.51.100.7","ttl":600,"prio":0},
+ {"recordId":31,"name":"example.com","type":"MX","data":"mail.example.com","ttl":3600,"prio":10}]}'
+# A stand-in for curl that logs "METHOD URL BODY" and answers "<body>\n<http code>",
+# the shape _contabo_call asks for with -w. FAKE_API picks the scenario.
+fake_curl() {
+  local method=GET url="" body="" prev="" a
+  for a in "$@"; do
+    case "$prev" in -X) method="$a" ;; -d) body="$a" ;; esac
+    case "$a" in http*) url="$a" ;; esac
+    prev="$a"
+  done
+  printf '%s %s %s\n' "$method" "$url" "$body" >> "$CURL_LOG"
+  case "$url" in
+    # contabo_token does not ask curl for a status code (-w), so it gets a bare body.
+    *openid-connect*) printf '{"access_token":"tok"}'; return 0 ;;
+  esac
+  case "${FAKE_API:-ok}" in
+    zone-missing) printf '{"message":"zone not found"}\n404' ;;
+    patch-fails)
+      if [[ "$method" == "GET" ]]; then printf '%s\n200' "$DNS_RECORDS"; else printf '{"message":"invalid data"}\n400'; fi ;;
+    *)
+      if [[ "$method" == "GET" ]]; then printf '%s\n200' "$DNS_RECORDS"; else printf '{"data":[]}\n200'; fi ;;
+  esac
+}
+dns_run() {  # dns_run <scenario> <ip> ; prints the exit status
+  ( : > "$CURL_LOG"
+    export FAKE_API="$1" CONTABO_CLIENT_ID=i CONTABO_CLIENT_SECRET=s CONTABO_API_USER=u CONTABO_API_PASSWORD=p
+    curl() { fake_curl "$@"; }
+    wait_for_propagation() { return 0; }
+    dns_cutover_domain example.com "$2" >/dev/null 2>&1; echo $? )
+}
+check "cutover succeeds against a healthy API" "$(dns_run ok 203.0.113.9)" "0"
+check "the apex A record is updated by its own id, keeping its 600s TTL" \
+  "$(grep -c 'PATCH .*/records/11 .*"ttl": 600' "$CURL_LOG")" "1"
+check "the real SPF record (id 21) is updated, keeping its 300s TTL" \
+  "$(grep -c 'PATCH .*/records/21 .*include:zoho.eu +ip4:203.0.113.9 ~all.*"ttl": 300' "$CURL_LOG")" "1"
+check "the site-verification TXT record (listed first) is never touched" \
+  "$(grep -c '/records/22' "$CURL_LOG" | tr -d ' ')" "0"
+check "no record is created when one already exists" "$(grep -c '^POST https://api.contabo.com' "$CURL_LOG" | tr -d ' ')" "0"
+check "an unreadable zone stops the cutover" "$(dns_run zone-missing 203.0.113.9)" "1"
+check "...before a single record is written" "$(grep -cE '^(POST|PATCH|DELETE) https://api.contabo.com' "$CURL_LOG" | tr -d ' ')" "0"
+check "a rejected update is reported as a failure, not 'DNS updated'" "$(dns_run patch-fails 203.0.113.9)" "1"
+check "a hostname instead of an IPv4 is refused" "$(dns_run ok vmi123.contaboserver.net)" "1"
+check "...without calling the API at all" "$(wc -l < "$CURL_LOG" | tr -d ' ')" "0"
+check "_contabo_call surfaces the API's own message on failure" \
+  "$( ( curl() { printf '{"message":"quota exceeded"}\n429'; }; _contabo_call GET http://x tok 2>&1 >/dev/null ) | sed 's/\x1b\[[0-9;]*m//g' )" \
+  "[!!] Contabo API GET failed (HTTP 429): quota exceeded"
+
+# ---------------------------------------------------------------------------
+group "Database users: exact passwords, no shell quoting, never passwordless"
+check "sql_quote doubles quotes and backslashes" "$(sql_quote "it's a\\b")" "'it''s a\\\\b'"
+check "identifier with a backtick is escaped" "$(ident_quote 'a`b')" '`a``b`'
+SQL_OUT=$(build_db_user_sql 'my-db' "app'user" "p'a\\ss\$x")
+check "user SQL carries the password byte-for-byte (escaped for SQL only)" \
+  "$(printf '%s\n' "$SQL_OUT" | grep -c "IDENTIFIED BY 'p''a\\\\\\\\ss\$x';")" "4"
+check "user SQL covers both localhost and 127.0.0.1" \
+  "$(printf '%s\n' "$SQL_OUT" | grep -c "@'127.0.0.1'")" "3"
+check "an existing user's password is corrected (ALTER USER), not left as it was" \
+  "$(printf '%s\n' "$SQL_OUT" | grep -c '^ALTER USER')" "2"
+check "create_db_user sends the SQL on stdin" \
+  "$( ( c_ssh_pipe() { cat > "$TMP/sent.sql"; }; create_db_user d u "pa'ss" >/dev/null 2>&1; grep -c "IDENTIFIED BY 'pa''ss'" "$TMP/sent.sql" ) )" "4"
+check "create_db_user refuses an empty password (no passwordless MySQL user)" \
+  "$( ( c_ssh_pipe() { cat > "$TMP/sent2.sql"; }; create_db_user d u '' >/dev/null 2>&1; rc=$?; echo "rc=$rc sent=$([[ -f "$TMP/sent2.sql" ]] && wc -c < "$TMP/sent2.sql" || echo 0)" ) | tr -s ' ' )" "rc=1 sent=0"
+
+# ---------------------------------------------------------------------------
+group "Connection probe: password travels in MYSQL_PWD, never as an argument"
+export MOCK_MYSQL_ARGV_LOG="$TMP/mysql-argv.log"; : > "$MOCK_MYSQL_ARGV_LOG"
+probe() { _db_connect_probe_script | { printf 'user=%q; pass=%q; db=%q\n' appuser "$1" appdb; cat; } | c_ssh_pipe target "bash -s"; }
+export EXPECT_PWD="s3cr'et\$1"
+check "right password -> connects" "$(probe "s3cr'et\$1")" "yes"
+check "wrong password -> refused" "$(probe 'nope')" "no"
+check "the password never appears in mysql's argument list" \
+  "$(grep -c "s3cr" "$MOCK_MYSQL_ARGV_LOG" | tr -d ' ')" "0"
+unset EXPECT_PWD MOCK_MYSQL_ARGV_LOG
+
+# ---------------------------------------------------------------------------
+group "Dump charset: never latin1 for data that is not latin1"
+check "utf8 (mb3) tables -> utf8mb4 (latin1 would turn ă ș ț into '?')" "$(pick_dump_charset utf8)"   "utf8mb4"
+check "utf8mb4 tables -> utf8mb4"        "$(pick_dump_charset utf8mb4)"       "utf8mb4"
+check "pure latin1 stays latin1 (byte-exact)" "$(pick_dump_charset latin1)"   "latin1"
+check "cp1250 keeps its own charset"     "$(pick_dump_charset cp1250)"        "cp1250"
+check "mixed charsets -> utf8mb4"        "$(pick_dump_charset 'latin1 utf8mb4')" "utf8mb4"
+check "no tables -> utf8mb4"             "$(pick_dump_charset '')"            "utf8mb4"
+check "an odd value is not passed through to a shell/SQL" "$(pick_dump_charset 'x;drop')" "utf8mb4"
+dump_cmd_for() {  # dump_cmd_for <table charsets> ; prints the mysqldump/CREATE DATABASE lines issued
+  ( : > "$TMP/cmds.log"
+    c_ssh()      { printf '%s\n' "$*" >> "$TMP/cmds.log"; case "$*" in *character_set_name*) echo "$1x" >/dev/null; printf '%s\n' "$CHARSETS_FAKE" ;; *) echo 5 ;; esac; }
+    c_ssh_pipe() { cat >/dev/null; printf '%s\n' "$*" >> "$TMP/cmds.log"; }
+    CHARSETS_FAKE="$1" migrate_one_database example.com wp_db wpuser 'pw' >/dev/null 2>&1
+    grep -oE '(mysqldump --default-character-set=[a-z0-9]+|CHARACTER SET [a-z0-9]+)' "$TMP/cmds.log" | tr '\n' ',' )
+}
+check "a utf8 database is dumped and created as utf8mb4" \
+  "$(dump_cmd_for utf8)" "CHARACTER SET utf8mb4,mysqldump --default-character-set=utf8mb4,"
+check "a latin1 database is still dumped as latin1" \
+  "$(dump_cmd_for latin1)" "CHARACTER SET latin1,mysqldump --default-character-set=latin1,"
+
+# ---------------------------------------------------------------------------
+group "Database selection: one account never picks up another's databases"
+check "prefix SQL matches the literal '<user>_' prefix" \
+  "$(prefixed_dbs_sql web)" "SELECT SCHEMA_NAME FROM information_schema.SCHEMATA WHERE SUBSTRING(SCHEMA_NAME,1,4)='web_';"
+check "prefix SQL does not use LIKE (where _ is a wildcard)" "$(prefixed_dbs_sql web | grep -ci 'like' | tr -d ' ')" "0"
+PD_OUT=$( (
+  discover_app_db_credentials() { printf 'web_wp\tweb_user\tpw\n'; }
+  c_ssh() { case "$*" in *SUBSTRING*) printf 'web_wp\nweb_shop\n' ;; *"SCHEMA_NAME='web_wp'"*) echo web_wp ;; esac; }
+  migrate_one_database() { echo "MIGRATED:$2" >> "$TMP/migrated.log"; }
+  : > "$TMP/migrated.log"
+  phase_migrate_database example.com web web 2>&1 | sed 's/\x1b\[[0-9;]*m//g' | grep -c 'web_shop'
+  cat "$TMP/migrated.log" | tr '\n' ','
+) )
+check "an extra database is named in a warning, not silently left behind" "$(printf '%s' "$PD_OUT" | head -1)" "1"
+check "only the app's own database is migrated" "$(printf '%s' "$PD_OUT" | tail -1)" "MIGRATED:web_wp,"
+
+# ---------------------------------------------------------------------------
+group "Mailbox password hash: exact match on the local part"
+mkdir -p "$TMP/home/alice/etc/example.com"
+printf 'john.smith:HASH-DOT:1:2\njohn-smith:HASH-DASH:1:2\njohnXsmith:HASH-X:1:2\ninfo:HASH-INFO:1:2\n' > "$TMP/home/alice/etc/example.com/shadow"
+export SRC_HOME_BASE="$TMP/home"
+check "a dotted name returns its own hash, not a lookalike's" "$(source_mail_hash alice example.com john.smith)" "HASH-DOT"
+check "a plain name still works" "$(source_mail_hash alice example.com info)" "HASH-INFO"
+check "a missing mailbox returns nothing" "$(source_mail_hash alice example.com nobody)" ""
+check "a missing domain returns nothing" "$(source_mail_hash alice nowhere.example john.smith)" ""
+unset SRC_HOME_BASE
+
+# ---------------------------------------------------------------------------
+group "Wizard: a failed migration is never followed by DNS cutover"
+# The variables set inside are read by step_migrate in the sourced wizard.
+# shellcheck disable=SC2034
+wiz_run() {  # wiz_run <accounts, one 'domain user' per line> ; prints "rc=<n> dns=<domains> sanity=<domains>"
+  ( export REPO_ROOT
+    # shellcheck source=../bin/migrate-wizard.sh
+    source "$REPO_ROOT/bin/migrate-wizard.sh"
+    AUDIT_DIR="$TMP/wizaudit"; mkdir -p "$AUDIT_DIR"
+    DO_DNS_CUTOVER=1; TARGET_PUBLIC_IP=203.0.113.9; ACCOUNT_LIST="$1"
+    : > "$TMP/wiz.log"
+    confirm()             { return 0; }
+    migrate_account()     { [[ "$1" != bad.example.com ]]; }
+    dns_cutover_domain()  { echo "DNS:$1" >> "$TMP/wiz.log"; }
+    request_certificate() { :; }
+    sanity_check_domain() { echo "SANITY:$1" >> "$TMP/wiz.log"; }
+    sanity_report_summary() { :; }
+    step_migrate >/dev/null 2>&1; rc=$?
+    echo "rc=$rc dns=$(grep '^DNS:' "$TMP/wiz.log" | tr '\n' ' ')sanity=$(grep '^SANITY:' "$TMP/wiz.log" | tr '\n' ' ')" )
+}
+check "DNS and sanity run only for the account that migrated; exit status is non-zero" \
+  "$(wiz_run $'good.example.com goodu\nbad.example.com badu')" \
+  "rc=1 dns=DNS:good.example.com sanity=SANITY:good.example.com "
+check "a fully successful run exits 0" \
+  "$(wiz_run $'good.example.com goodu')" "rc=0 dns=DNS:good.example.com sanity=SANITY:good.example.com "
 
 # ---------------------------------------------------------------------------
 printf '\n\033[1mResult:\033[0m %d passed, %d failed\n' "$PASS" "$FAIL"

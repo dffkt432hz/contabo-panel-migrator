@@ -104,6 +104,17 @@ missing, or the target lacks room for the source's real footprint. Because
 the results are shell variables, the wizard must call both functions
 directly — never inside a pipe or `$(...)`, which would discard them.
 
+## How DNS changes stay safe
+
+`lib/contabo-api.sh` funnels every request through `_contabo_call`, which
+succeeds only on an HTTP 2xx and otherwise surfaces the API's own message.
+`dns_cutover_domain` refuses a non-IPv4 target, requires the zone to be
+readable before it writes anything, stops at the first rejected call, and
+never reports success it did not get. Updates keep a record's existing TTL,
+and SPF is changed in place by finding the real SPF record by its content
+(so a site-verification TXT record can never be overwritten), adding the new
+server, and keeping every existing mechanism and the domain's own policy.
+
 ## How secrets move through the toolkit
 
 - Contabo credentials are prompted for without echo, or read from a

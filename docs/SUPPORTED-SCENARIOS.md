@@ -31,7 +31,7 @@ explicitly *not* automated, on purpose:
   domain. The source audit lists any addon/parked domains it finds on each
   account (so nothing is a surprise), but they need their own run.
 
-- **DNS records other than A/www/SPF/DKIM** (MX, NS, SOA, DMARC, and any
+- **DNS records other than A (apex, www, an existing mail host) and SPF** (MX, NS, SOA, DMARC, DKIM, and any
   site-verification TXT records) are left untouched. Touching MX/NS
   automatically is exactly the kind of "helpful" automation that breaks a
   domain in a way that's hard to notice until mail stops arriving.

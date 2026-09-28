@@ -110,7 +110,7 @@ phase_transfer_files() {
   fi
 
   local src_count dst_count
-  src_count=$(c_ssh source "find $(printf '%q' "$real_root") -type f 2>/dev/null | wc -l" | tr -d '[:space:]')
+  src_count=$(c_ssh source "find -L $(printf '%q' "$real_root") -type f 2>/dev/null | wc -l" | tr -d '[:space:]')
   dst_count=$(c_ssh target "find -L /home/$(printf '%q' "$new_user")/public_html -type f 2>/dev/null | wc -l" | tr -d '[:space:]')
   log "  File count — source: ${src_count:-?}, target: ${dst_count:-?}"
   if [[ "${src_count:-0}" -ne "${dst_count:-0}" ]]; then
@@ -189,8 +189,12 @@ phase_migrate_database() {
     # abandoned feature) — in that case replicate the source's real
     # behaviour rather than helpfully creating an empty database that
     # never existed.
-    local exists
-    exists=$(c_ssh source "mysql -N -B -e \"SHOW DATABASES LIKE '${db_name}';\" 2>/dev/null" | tr -d '[:space:]')
+    local exists=""
+    if [[ "$db_name" =~ ^[A-Za-z0-9_-]+$ ]]; then
+      exists=$(c_ssh source "mysql -N -B -e \"SELECT SCHEMA_NAME FROM information_schema.SCHEMATA WHERE SCHEMA_NAME='${db_name}';\" 2>/dev/null" | tr -d '[:space:]')
+    else
+      warn "  Database name '${db_name}' from the app config has unexpected characters — not using it."
+    fi
     if [[ -z "$exists" ]]; then
       warn "  The app references database '${db_name}' but it does not exist on the source."
       warn "  Not creating it on the target either — flagging instead of silently 'fixing' it."
@@ -198,13 +202,25 @@ phase_migrate_database() {
     fi
   fi
 
-  # Fall back to prefix discovery if the app config gave us nothing.
-  local dbs
+  # Every database cPanel created for this account carries the "<user>_"
+  # prefix. Matched on the literal prefix (see prefixed_dbs_sql) so one
+  # account can never pick up another account's databases.
+  local all_dbs dbs
+  all_dbs=$(account_prefixed_dbs source "$cpanel_user")
   if [[ -n "$db_name" ]]; then
     dbs="$db_name"
+    # Only the database the app config names is migrated. Say so loudly if
+    # the account owns others, instead of leaving them behind unnoticed.
+    local extras
+    extras=$(printf '%s\n' "$all_dbs" | grep -vxF "$db_name" | grep -v '^$' || true)
+    if [[ -n "$extras" ]]; then
+      warn "  This account owns other database(s) that are NOT being migrated:"
+      printf '%s\n' "$extras" | sed 's/^/        /' >&2
+      warn "  Migrate each with: migrate_one_database '${domain}' '<database>' '<db user>' '<db password>'"
+    fi
   else
-    dbs=$(c_ssh source "mysql -N -B -e \"SELECT SCHEMA_NAME FROM information_schema.SCHEMATA WHERE SCHEMA_NAME LIKE '${cpanel_user}%';\" 2>/dev/null")
-    [[ -n "$dbs" ]] && warn "  No app config found — falling back to prefix match on '${cpanel_user}%'."
+    dbs="$all_dbs"
+    [[ -n "$dbs" ]] && warn "  No app config found — falling back to the '${cpanel_user}_' prefix match."
   fi
 
   if [[ -z "$dbs" ]]; then
@@ -222,23 +238,29 @@ phase_migrate_database() {
 migrate_one_database() {
   local domain="$1" db="$2" db_user="$3" db_pass="$4"
 
-  # Never trust the schema-level default charset: check the REAL per-table
-  # collation. A database labelled latin1 whose tables hold clean utf8mb4
-  # bytes is common, and dumping it with the wrong charset silently
-  # mangles every non-ASCII character with no error at any point.
-  local collation charset collate_full
-  collation=$(c_ssh source "mysql -N -B -e \"SELECT table_collation FROM information_schema.tables WHERE table_schema='${db}' AND table_type='BASE TABLE' LIMIT 1;\" 2>/dev/null" | tr -d '[:space:]')
-  if [[ "$collation" == utf8mb4* ]]; then
-    charset="utf8mb4"; collate_full="utf8mb4_unicode_ci"
-  else
-    charset="latin1"; collate_full="latin1_swedish_ci"
+  if ! [[ "$db" =~ ^[A-Za-z0-9_-]+$ ]]; then
+    err "  Database name '${db}' has characters this toolkit will not put into SQL — migrate it by hand."
+    return 1
   fi
-  log "  Database '${db}': real collation '${collation:-unknown}' -> dumping as ${charset}"
+
+  # Never trust the schema-level default charset: read the REAL charset of
+  # every table. See pick_dump_charset for the rules — in particular a utf8
+  # database must never be dumped as latin1, which silently turns every
+  # character latin1 lacks (Romanian ă ș ț among them) into '?'.
+  local charsets charset db_default_charset collate_clause=""
+  charsets=$(db_charsets source "$db")
+  charset=$(pick_dump_charset "$charsets")
+  if [[ "$charset" == "binary" ]]; then db_default_charset="utf8mb4"; else db_default_charset="$charset"; fi
+  case "$db_default_charset" in
+    utf8mb4) collate_clause=" COLLATE utf8mb4_unicode_ci" ;;
+    latin1)  collate_clause=" COLLATE latin1_swedish_ci" ;;
+  esac
+  log "  Database '${db}': table charset(s) '${charsets:-none}' -> dumping as ${charset}"
 
   # Keep the SAME database name on the target. Renaming it would force an
   # edit to every app config file that references it — more work, and a
   # step that is easy to forget on one site out of forty.
-  c_ssh target "mysql -e \"CREATE DATABASE IF NOT EXISTS \\\`${db}\\\` CHARACTER SET ${charset} COLLATE ${collate_full};\""
+  c_ssh target "mysql -e \"CREATE DATABASE IF NOT EXISTS \\\`${db}\\\` CHARACTER SET ${db_default_charset}${collate_clause};\""
 
   # Recreate the application's own DB user with its original name and
   # password. Without this the database exists but nothing can connect to
@@ -277,37 +299,28 @@ migrate_one_database() {
 
 create_db_user() {
   local db="$1" user="$2" pass="$3"
-  # Written as a here-doc'd script rather than an `ssh ... 'mysql -e "..."'`
-  # one-liner on purpose: a password containing `$` (or a quote) is silently
-  # corrupted by that nested quoting, producing a user that exists but whose
-  # password doesn't work, with a misleading auth error at the far end.
-  #
-  # Both 'localhost' and '127.0.0.1' grants are created: MySQL/MariaDB do
-  # not treat them as interchangeable when matching grants, and a Laravel
-  # .env with DB_HOST=127.0.0.1 will fail against a localhost-only grant.
-  local rc=0
-  remote_script target "$db" "$user" "$pass" <<'SCRIPT_EOF' || rc=$?
-db="$1"; user="$2"; pass="$3"
-tmp=$(mktemp)
-chmod 600 "$tmp"
-{
-  printf "CREATE USER IF NOT EXISTS '%s'@'localhost' IDENTIFIED BY '%s';\n" "$user" "$pass"
-  printf "CREATE USER IF NOT EXISTS '%s'@'127.0.0.1' IDENTIFIED BY '%s';\n" "$user" "$pass"
-  printf "GRANT ALL PRIVILEGES ON \`%s\`.* TO '%s'@'localhost';\n" "$db" "$user"
-  printf "GRANT ALL PRIVILEGES ON \`%s\`.* TO '%s'@'127.0.0.1';\n" "$db" "$user"
-  printf "FLUSH PRIVILEGES;\n"
-} > "$tmp"
-mysql < "$tmp"
-rc=$?
-rm -f "$tmp"
-exit $rc
-SCRIPT_EOF
-  if [[ $rc -eq 0 ]]; then
+
+  # An empty password almost always means the app config builds it from an
+  # environment variable or constant we could not read. Creating a MySQL
+  # user with NO password and full rights on the database would be worse
+  # than creating none.
+  if [[ -z "$pass" ]]; then
+    warn "  No password found for DB user '${user}' in the app config — NOT creating a passwordless user."
+    warn "  Create it by hand on the target, then re-run the sanity check."
+    return 1
+  fi
+
+  # The SQL is built locally with proper escaping (see build_db_user_sql)
+  # and sent to mysql on STDIN. Nothing here goes through shell quoting, so
+  # a password containing $, ', ", `, \ or * arrives exactly as it was, and
+  # it never appears in a process argument list on either machine.
+  if build_db_user_sql "$db" "$user" "$pass" | c_ssh_pipe target "mysql"; then
     ok "  DB user '${user}' recreated with its original password (no app config edit needed)."
   else
     err "  Failed to create DB user '${user}' — the site will not be able to connect."
-    err "  If the target MySQL predates 8.0/10.1, CREATE USER IF NOT EXISTS is"
-    err "  unsupported; create the user manually and re-run the sanity check."
+    err "  This needs MySQL 5.7.6+ or MariaDB 10.2+ (CREATE USER IF NOT EXISTS / ALTER USER)."
+    err "  On an older server create the user manually and re-run the sanity check."
+    return 1
   fi
 }
 
@@ -362,6 +375,20 @@ phase_migrate_mail() {
   done <<< "$boxes"
 }
 
+# The password hash for one mailbox, matched on the EXACT first field. The
+# earlier `grep '^first.last:'` treated the dot as "any character", so it
+# also matched first-last or firstXlast and could return two hashes glued
+# together. SRC_HOME_BASE exists so the tests can aim this at a fixture.
+source_mail_hash() {
+  remote_script source "${SRC_HOME_BASE:-/home}" "$1" "$2" "$3" <<'SCRIPT_EOF'
+base="$1"; user="$2"; dom="$3"; box="$4"
+f="$base/$user/etc/$dom/shadow"
+[ -r "$f" ] || exit 0
+awk -F: -v u="$box" '$1 == u { print $2; exit }' "$f"
+exit 0
+SCRIPT_EOF
+}
+
 migrate_one_mailbox() {
   local domain="$1" cpanel_user="$2" new_user="$3" fulladdr="$4"
   local mailuser="${fulladdr%@*}"
@@ -371,7 +398,7 @@ migrate_one_mailbox() {
   # Only the password *hash* is ever available (never plaintext), which is
   # also why IMAP-level tools like imapsync are not an option here.
   local hash
-  hash=$(c_ssh source "grep '^${mailuser}:' /home/$(printf '%q' "$cpanel_user")/etc/$(printf '%q' "$maildomain")/shadow 2>/dev/null | cut -d: -f2")
+  hash=$(source_mail_hash "$cpanel_user" "$maildomain" "$mailuser")
   if [[ -z "$hash" ]]; then
     warn "    No password hash on the source for ${fulladdr} — skipping this mailbox."
     warn "    (Check the local part: source panels sometimes store a longer name"

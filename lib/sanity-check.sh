@@ -86,7 +86,7 @@ check_database_connectivity() {
   fi
 
   local exists
-  exists=$(c_ssh target "mysql -N -B -e \"SHOW DATABASES LIKE '${db_name}';\" 2>/dev/null" | tr -d '[:space:]')
+  exists=$(c_ssh target "mysql -N -B -e \"SELECT SCHEMA_NAME FROM information_schema.SCHEMATA WHERE SCHEMA_NAME='${db_name}';\" 2>/dev/null" | tr -d '[:space:]')
   if [[ -z "$exists" ]]; then
     _report FAIL "database '${db_name}' does not exist on the target" \
       "re-run: phase_migrate_database '${domain}' '${cpanel_user}' '${new_user}'"
@@ -103,17 +103,10 @@ check_database_connectivity() {
   # the application's own password. Anything less doesn't prove the site
   # will work.
   local can_connect
-  can_connect=$(remote_script target "$db_user" "$db_pass" "$db_name" <<'SCRIPT_EOF'
-user="$1"; pass="$2"; db="$3"
-if mysql -u"$user" -p"$pass" -h 127.0.0.1 -N -B -e "USE \`$db\`; SELECT 1;" >/dev/null 2>&1; then
-  echo yes
-elif mysql -u"$user" -p"$pass" -h localhost -N -B -e "USE \`$db\`; SELECT 1;" >/dev/null 2>&1; then
-  echo localhost-only
-else
-  echo no
-fi
-SCRIPT_EOF
-)
+  # The credentials travel as the first line of the script on STDIN and the
+  # password reaches mysql through MYSQL_PWD, so it is never part of any
+  # process argument list (and an empty password cannot trigger a prompt).
+  can_connect=$(_db_connect_probe_script | { printf 'user=%q; pass=%q; db=%q\n' "$db_user" "$db_pass" "$db_name"; cat; } | c_ssh_pipe target "bash -s")
   case "$can_connect" in
     yes)
       _report PASS "app can connect to '${db_name}' as '${db_user}'"
@@ -127,6 +120,21 @@ SCRIPT_EOF
         "re-run: create_db_user '${db_name}' '${db_user}' '<password from the app config>'"
       ;;
   esac
+}
+
+# The body of the connection probe run on the target. The credentials are
+# prepended by the caller as shell variables; MYSQL_PWD carries the password.
+_db_connect_probe_script() {
+  cat <<'SCRIPT_EOF'
+export MYSQL_PWD="$pass"
+if mysql -u"$user" -h 127.0.0.1 -N -B -e "USE \`$db\`; SELECT 1;" >/dev/null 2>&1 </dev/null; then
+  echo yes
+elif mysql -u"$user" -h localhost -N -B -e "USE \`$db\`; SELECT 1;" >/dev/null 2>&1 </dev/null; then
+  echo localhost-only
+else
+  echo no
+fi
+SCRIPT_EOF
 }
 
 check_http_response() {
@@ -196,13 +204,26 @@ check_cert_validity() {
 
 check_php_limits_effective() {
   local new_user="$1"
-  local mem
+  local mem want wn hn envf="${AUDIT_DIR:-/tmp}/source-php-limits.env"
   mem=$(c_ssh target "php -r 'echo ini_get(\"memory_limit\");' 2>/dev/null" | tr -d '[:space:]')
+  want=""
+  [[ -s "$envf" ]] && want=$(sed -n 's/^memory_limit=//p' "$envf" | head -1)
+
   if [[ -z "$mem" ]]; then
     _report WARN "could not read the effective PHP memory_limit on the target" "confirm the php CLI is installed: ssh target 'php -v'"
+  elif [[ -n "$want" ]]; then
+    # The source's real value is known, so compare against THAT rather than
+    # guessing what a "stock" value looks like.
+    wn=$(ini_to_num "$want" memory_limit); hn=$(ini_to_num "$mem" memory_limit)
+    if [[ -n "$wn" && -n "$hn" && "$hn" -lt "$wn" ]]; then
+      _report WARN "PHP memory_limit is ${mem} on the target but was ${want} on the source — heavy sites will 500 with nothing in the log" \
+        "run fix_php_parity  (from lib/audit-target.sh)"
+    else
+      _report PASS "PHP memory_limit is ${mem} (source: ${want})"
+    fi
   elif [[ "$mem" == "128M" || "$mem" == "64M" || "$mem" == "32M" ]]; then
-    _report WARN "PHP memory_limit is still a stock default (${mem}) — heavy sites will 500 with nothing in the log" \
-      "run fix_php_parity  (from lib/audit-target.sh)"
+    _report WARN "PHP memory_limit is a stock default (${mem}) and the source's value is unknown — heavy sites may 500 with nothing in the log" \
+      "compare with the source's memory_limit, then run fix_php_parity  (from lib/audit-target.sh)"
   else
     _report PASS "PHP memory_limit is ${mem}"
   fi
@@ -232,7 +253,7 @@ check_mail_setup() {
       "echo '${domain}' >> /etc/dkim-domains.txt && systemctl restart opendkim   (then publish the matching TXT record)"
   fi
 
-  catchall=$(c_ssh target "grep -c \"^@${domain}\" /etc/postfix/virtual 2>/dev/null" | tr -d '[:space:]')
+  catchall=$(c_ssh target "grep -c \"^@${domain}[[:space:]]\" /etc/postfix/virtual 2>/dev/null" | tr -d '[:space:]')
   if [[ "${catchall:-0}" -gt 0 ]]; then
     _report PASS "catch-all address configured"
   else

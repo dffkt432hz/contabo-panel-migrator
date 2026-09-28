@@ -17,10 +17,14 @@ for _lib in common contabo-api audit-source audit-target migrate-account dns-cut
   source "$REPO_ROOT/lib/${_lib}.sh" || { echo "Failed to load lib/${_lib}.sh" >&2; exit 1; }
 done
 
-AUDIT_DIR="$REPO_ROOT/audit-$(date +%Y%m%d-%H%M%S)"
-mkdir -p "$AUDIT_DIR"
-chmod 700 "$AUDIT_DIR"
-export AUDIT_DIR
+# Created by main() via init_run_dir, not at load time, so sourcing this file
+# (as the tests do) has no side effects.
+init_run_dir() {
+  AUDIT_DIR="$REPO_ROOT/audit-$(date +%Y%m%d-%H%M%S)"
+  mkdir -p "$AUDIT_DIR"
+  chmod 700 "$AUDIT_DIR"
+  export AUDIT_DIR
+}
 
 DO_DNS_CUTOVER=0
 ACCOUNT_LIST=""
@@ -166,7 +170,19 @@ HELP
   ask CONTABO_CLIENT_SECRET "  client_secret" "" secret
   ask CONTABO_API_USER      "  API username (login email)"
   ask CONTABO_API_PASSWORD  "  API password (the dedicated one)" "" secret
-  ask TARGET_PUBLIC_IP      "  Target server public IP (what DNS should point at)" "${TARGET_HOST}"
+  # DNS A records and SPF need an IPv4 address. TARGET_HOST is often a
+  # hostname, so it is only offered as the default when it is one.
+  local _default_ip=""
+  is_ipv4 "${TARGET_HOST}" && _default_ip="${TARGET_HOST}"
+  ask TARGET_PUBLIC_IP      "  Target server public IPv4 (what DNS should point at)" "$_default_ip"
+  local _tries=0
+  until is_ipv4 "${TARGET_PUBLIC_IP:-}"; do
+    _tries=$((_tries + 1))
+    [[ $_tries -ge 3 ]] && die "'${TARGET_PUBLIC_IP:-}' is not an IPv4 address; DNS cannot be automated without one."
+    warn "'${TARGET_PUBLIC_IP:-}' is not an IPv4 address (a hostname would create an invalid A record)."
+    TARGET_PUBLIC_IP=""
+    ask TARGET_PUBLIC_IP    "  Target server public IPv4" ""
+  done
   export CONTABO_CLIENT_ID CONTABO_CLIENT_SECRET CONTABO_API_USER CONTABO_API_PASSWORD TARGET_PUBLIC_IP
 
   log "Verifying the credentials before we rely on them..."
@@ -245,13 +261,20 @@ step_migrate() {
   # A here-string, not a pipe: a `while read` on the right of a pipe runs
   # in a subshell, so the issue counters in sanity-check.sh would reset to
   # zero and the final summary would always claim a clean run.
-  local n=0 domain acct
+  local n=0 failed_n=0 failed_list="" domain acct
   while read -r domain acct; do
     [[ -z "$domain" || -z "$acct" ]] && continue
     n=$((n + 1))
     section "[${n}/${total}] ${domain}"
 
-    migrate_account "$domain" "$acct" "$acct"
+    # A failed migration must never be followed by a DNS cutover: that would
+    # point live traffic at a server that does not have the site.
+    if ! migrate_account "$domain" "$acct" "$acct"; then
+      err "${domain}: the migration did not complete — skipping DNS cutover and the sanity check for it."
+      failed_n=$((failed_n + 1))
+      failed_list+="  - ${domain}"$'\n'
+      continue
+    fi
 
     if [[ "$DO_DNS_CUTOVER" -eq 1 ]]; then
       if confirm "Cut DNS over for ${domain} now?"; then
@@ -270,14 +293,20 @@ step_migrate() {
   sanity_report_summary
 
   section "Done"
-  ok "Migrated ${n} account(s)."
+  ok "Migrated $((n - failed_n)) of ${n} account(s)."
+  if [[ "$failed_n" -gt 0 ]]; then
+    err "${failed_n} account(s) did NOT migrate and were left untouched by DNS:"
+    printf '%s' "$failed_list" >&2
+  fi
   log "Run artifacts (account list, generated passwords, findings): ${AUDIT_DIR}"
   warn "Keep the source server live for 24-48 hours as a fallback before"
   warn "decommissioning it, and re-check mail flow in both directions first."
+  [[ "$failed_n" -eq 0 ]]
 }
 
 main() {
   banner
+  init_run_dir
   step_preflight
   load_config
   step_scenario
@@ -290,4 +319,8 @@ main() {
   step_migrate
 }
 
-main "$@"
+# Only run when executed, not when sourced (the tests source this file to
+# exercise individual steps).
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+  main "$@"
+fi

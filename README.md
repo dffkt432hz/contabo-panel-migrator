@@ -57,11 +57,12 @@ automatically, every time.
    and catch-all address setup. Databases keep their original name, user
    and password, so the application's own config file needs **no edits**
    after the move.
-4. **Cuts DNS over via the Contabo API** — A/www records and an
-   SPF-preserving TXT update (never touches MX/NS/SOA/DMARC), waits for
-   real propagation, then requests a Let's Encrypt certificate — in that
-   order, because doing it out of order is exactly how a cert request
-   fails.
+4. **Cuts DNS over via the Contabo API** — A records (apex, `www`, an
+   existing `mail.` host) and an in-place SPF update that adds the new
+   server and keeps everything already authorized (never touches
+   MX/NS/SOA/DMARC/DKIM or verification records), waits for real
+   propagation, then requests a Let's Encrypt certificate — in that order,
+   because doing it out of order is exactly how a cert request fails.
 5. **Runs a sanity check with the fix already written for you** — file
    count mismatches, a real database connection attempt as the
    application's own user, wrong HTTP/HTTPS response codes, missing or
@@ -123,9 +124,15 @@ each path actually automates.
 - File transfers never go directly server-to-server; they're always
   relayed through the machine running the wizard, so the source and
   target never need standing SSH trust in each other.
-- DNS cutover only ever touches A/www/SPF/DKIM records, and SPF is
-  rewritten in an `include:`-preserving way so a domain on Zoho/Microsoft
-  365/etc. doesn't lose outbound mail deliverability.
+- DNS cutover only ever touches the A records (apex, `www`, and an
+  existing `mail.` host) and the SPF record. SPF is updated in place: the
+  new server is *added* and everything the domain already authorized
+  (`include:` providers, `mx`, other IPs, its own `-all`/`~all` policy) is
+  kept, so a domain on Zoho/Microsoft 365/etc. doesn't lose outbound mail
+  deliverability. Existing TTLs are preserved, the zone must be readable
+  before anything is written, and any rejected API call stops the cutover
+  instead of being reported as success. A failed account migration is never
+  followed by a DNS cutover.
 - Nothing on the source server is ever deleted or disabled by this
   toolkit. Decommissioning the source is a manual, deliberate step you
   take after your own monitoring window — not something a script decides

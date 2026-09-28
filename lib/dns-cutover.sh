@@ -16,6 +16,12 @@ dns_cutover_domain() {
   local domain="$1" target_ip="$2"
   section "DNS cutover: $domain -> $target_ip"
 
+  if ! is_ipv4 "$target_ip"; then
+    err "'${target_ip}' is not an IPv4 address. An A record needs the server's public IPv4"
+    err "(a hostname here would create an invalid record). Nothing was changed."
+    return 1
+  fi
+
   local token
   token=$(contabo_token)
   if [[ -z "$token" ]]; then
@@ -27,42 +33,56 @@ dns_cutover_domain() {
     return 1
   fi
 
+  # The zone must be readable BEFORE anything is written. If the domain's
+  # nameservers are not Contabo's, its zone does not live here, and writing
+  # records into a zone nobody resolves would "succeed" while changing nothing.
+  if ! contabo_dns_list "$domain" "$token" >/dev/null; then
+    err "Could not read the DNS zone for ${domain} at Contabo. Nothing was changed."
+    err "If this domain's nameservers are not Contabo's, change its records at the"
+    err "provider that actually hosts its DNS instead."
+    return 1
+  fi
+
   # Apex A record.
   log "  Updating A record for ${domain}..."
-  contabo_dns_upsert "$domain" "$token" "$domain" "A" "$target_ip" >/dev/null
+  contabo_dns_upsert "$domain" "$token" "$domain" "A" "$target_ip" >/dev/null \
+    || { err "Could not update the A record for ${domain}. Stopping before touching anything else."; return 1; }
 
   # www — but only as an A record if it isn't already a CNAME. A CNAME and
   # an A record cannot coexist for the same name; creating one alongside
   # the other produces an invalid zone that resolvers handle unpredictably.
-  local www_cname
-  www_cname=$(contabo_dns_find_id "$domain" "$token" "www.${domain}" "CNAME")
+  local www_cname rc
+  www_cname=$(contabo_dns_find_id "$domain" "$token" "www.${domain}" "CNAME"); rc=$?
+  [[ $rc -eq 2 ]] && { err "Could not read the zone while checking www.${domain}."; return 1; }
   if [[ -n "$www_cname" ]]; then
     log "  www.${domain} is a CNAME — leaving it alone (it will follow the apex)."
   else
     log "  Updating A record for www.${domain}..."
-    contabo_dns_upsert "$domain" "$token" "www.${domain}" "A" "$target_ip" >/dev/null
+    contabo_dns_upsert "$domain" "$token" "www.${domain}" "A" "$target_ip" >/dev/null \
+      || { err "Could not update the A record for www.${domain}."; return 1; }
   fi
 
   # mail.<domain>, only if it already exists. Creating it where it never
   # existed would be inventing a hostname the domain's mail setup does not
   # use; leaving a stale one pointed at the old server breaks mail clients.
   local mail_a
-  mail_a=$(contabo_dns_find_id "$domain" "$token" "mail.${domain}" "A")
+  mail_a=$(contabo_dns_find_id "$domain" "$token" "mail.${domain}" "A"); rc=$?
+  [[ $rc -eq 2 ]] && { err "Could not read the zone while checking mail.${domain}."; return 1; }
   if [[ -n "$mail_a" ]]; then
     log "  Updating A record for mail.${domain}..."
-    contabo_dns_upsert "$domain" "$token" "mail.${domain}" "A" "$target_ip" >/dev/null
+    contabo_dns_upsert "$domain" "$token" "mail.${domain}" "A" "$target_ip" >/dev/null \
+      || { err "Could not update the A record for mail.${domain}."; return 1; }
     DOMAIN_HAS_MAIL_HOST=1
   else
     DOMAIN_HAS_MAIL_HOST=0
   fi
   export DOMAIN_HAS_MAIL_HOST
 
-  # SPF, rewritten in an include:-preserving way. A domain using a
-  # third-party mail provider (Zoho, Microsoft 365) carries include:
-  # mechanisms that a blind overwrite destroys, silently breaking its
-  # outbound deliverability.
-  log "  Updating SPF (preserving any existing include: mechanisms)..."
-  contabo_dns_upsert_spf "$domain" "$token" "$target_ip" >/dev/null
+  # SPF: the new server is ADDED to the existing record; everything already
+  # authorized (include:, mx, other ips, the -all/~all policy) is kept.
+  log "  Updating SPF (keeping every existing mechanism, adding this server)..."
+  contabo_dns_upsert_spf "$domain" "$token" "$target_ip" >/dev/null \
+    || { err "Could not update the SPF record for ${domain}. The A records above WERE changed."; return 1; }
 
   ok "  DNS updated. MX, NS, SOA, DMARC and verification TXT records untouched."
 
@@ -119,7 +139,9 @@ request_certificate() {
     fi
   fi
 
-  if ! c_ssh target "virtualmin generate-acme-cert --domain $(printf '%q' "$domain") ${hosts[*]}"; then
+  local host_args
+  host_args=$(printf ' %q' "${hosts[@]}")
+  if ! c_ssh target "virtualmin generate-acme-cert --domain $(printf '%q' "$domain")${host_args}"; then
     err "  Certificate request failed for ${domain}."
     err "  Check the domain's .htaccess for a catch-all rewrite that blocks"
     err "  /.well-known/acme-challenge/ before retrying — and do not retry in a"

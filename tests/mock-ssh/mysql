@@ -1,0 +1,6 @@
+#!/usr/bin/env bash
+# Mock mysql client for the offline tests. It "accepts" a login only when the
+# password arrives in MYSQL_PWD and matches $EXPECT_PWD, and it records every
+# argument it was given so a test can prove the password was never one of them.
+printf '%s\n' "$*" >> "${MOCK_MYSQL_ARGV_LOG:-/dev/null}"
+[[ "${MYSQL_PWD-}" == "${EXPECT_PWD-}" ]]

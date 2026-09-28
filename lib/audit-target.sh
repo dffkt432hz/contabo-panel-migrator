@@ -69,7 +69,7 @@ SCRIPT_EOF
 
 # Compares the source's recorded PHP limits with the target's. Returns 0 on
 # parity (target >= source for every key), 1 when at least one key is lower
-# on the target. A LOWER source value is never a problem, so it is ignored.
+# on the target, 2 when the target's limits cannot be read at all. A LOWER source value is never a problem, so it is ignored.
 check_php_parity() {
   local envf="${AUDIT_DIR:-/tmp}/source-php-limits.env"
   if [[ ! -s "$envf" ]]; then
@@ -81,7 +81,7 @@ check_php_parity() {
   tgt=$(php_limits_of target)
   if [[ -z "$tgt" ]]; then
     warn "Could not read PHP limits from the target (is the php CLI installed?)."
-    return 1
+    return 2
   fi
 
   while IFS='=' read -r key want; do
@@ -246,6 +246,16 @@ check_target_disk() {
   local db_need=$((need_db * 3 / 2))
   local rc=0
 
+  # An unreadable df is not "0 MB free". Say so and skip rather than fail a
+  # healthy target with a misleading number.
+  if ! [[ "$home_free" =~ ^[0-9]+$ ]]; then
+    warn "Could not read free space for /home on the target — skipping the disk check."
+    return 0
+  fi
+  if ! [[ "$db_free" =~ ^[0-9]+$ ]]; then
+    db_free="$home_free"; db_dev="$home_dev"
+  fi
+
   if [[ -n "$home_dev" && "$home_dev" == "$db_dev" ]]; then
     if disk_headroom_ok $((need_files + db_need)) "$home_free"; then
       ok "Disk: $((home_free / 1024)) MB free vs about $(((need_files + db_need) / 1024)) MB needed (files + databases share a filesystem)."
@@ -329,15 +339,21 @@ audit_target_full() {
 
   check_default_quota
 
-  if ! check_php_parity; then
-    warn "The target's PHP limits are lower than the source's. Heavy sites can 500 with"
-    warn "nothing in the error log when they hit the new, lower limit."
-    if confirm "Raise the target's PHP limits to match the source now? (restarts php-fpm briefly)"; then
-      fix_php_parity || warn "PHP parity is not fully resolved — see above."
-    else
-      log "Skipped. Run it later with: fix_php_parity"
-    fi
-  fi
+  local php_rc=0
+  check_php_parity || php_rc=$?
+  case "$php_rc" in
+    0) ;;
+    2) warn "PHP parity could not be checked; install the php CLI on the target and re-run." ;;
+    *)
+      warn "The target's PHP limits are lower than the source's. Heavy sites can 500 with"
+      warn "nothing in the error log when they hit the new, lower limit."
+      if confirm "Raise the target's PHP limits to match the source now? (restarts php-fpm briefly)"; then
+        fix_php_parity || warn "PHP parity is not fully resolved — see above."
+      else
+        log "Skipped. Run it later with: fix_php_parity"
+      fi
+      ;;
+  esac
 
   check_target_disk || rc=1
 

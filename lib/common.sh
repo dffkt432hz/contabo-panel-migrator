@@ -350,3 +350,104 @@ disk_headroom_ok() {
   [[ "$need" =~ ^[0-9]+$ && "$free" =~ ^[0-9]+$ ]] || return 1
   [[ $((need * (100 + margin) / 100)) -le "$free" ]]
 }
+
+# ---------------------------------------------------------------------------
+# Validation and SQL helpers
+# ---------------------------------------------------------------------------
+
+# is_ipv4 <value> — true for a dotted-quad IPv4 address (each octet 0-255).
+is_ipv4() {
+  local ip="${1:-}" o
+  [[ "$ip" =~ ^([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})$ ]] || return 1
+  for o in "${BASH_REMATCH[1]}" "${BASH_REMATCH[2]}" "${BASH_REMATCH[3]}" "${BASH_REMATCH[4]}"; do
+    [[ $((10#$o)) -le 255 ]] || return 1
+  done
+}
+
+# sql_quote <string> — prints a MySQL/MariaDB single-quoted string literal.
+# Backslashes are doubled and single quotes are doubled, so a password like
+#   it's a\b
+# reaches the server byte-for-byte instead of ending the string early or
+# having "\b" read as a backspace. (Assumes the default sql_mode; a server
+# running NO_BACKSLASH_ESCAPES is not supported.)
+sql_quote() {
+  local esc
+  esc=$(printf '%s' "${1-}" | sed -e 's/\\/\\\\/g' -e "s/'/''/g")
+  printf "'%s'" "$esc"
+}
+
+# ident_quote <name> — prints a backtick-quoted SQL identifier.
+ident_quote() {
+  local esc
+  esc=$(printf '%s' "${1-}" | sed -e 's/`/``/g')
+  printf '`%s`' "$esc"
+}
+
+# build_db_user_sql <db> <user> <password>
+# The SQL that (re)creates an application's DB user on both the 'localhost'
+# and '127.0.0.1' hosts (MySQL/MariaDB do not treat them as interchangeable)
+# and grants it its own database. ALTER USER runs after CREATE USER IF NOT
+# EXISTS so that re-running a migration also corrects a user left behind
+# with a different password. Sent to mysql on stdin, never as an argument.
+build_db_user_sql() {
+  local db="$1" user="$2" pass="$3" host qu qp qd qh
+  qu=$(sql_quote "$user"); qp=$(sql_quote "$pass"); qd=$(ident_quote "$db")
+  for host in localhost 127.0.0.1; do
+    qh=$(sql_quote "$host")
+    printf 'CREATE USER IF NOT EXISTS %s@%s IDENTIFIED BY %s;\n' "$qu" "$qh" "$qp"
+    printf 'ALTER USER %s@%s IDENTIFIED BY %s;\n' "$qu" "$qh" "$qp"
+    printf 'GRANT ALL PRIVILEGES ON %s.* TO %s@%s;\n' "$qd" "$qu" "$qh"
+  done
+  printf 'FLUSH PRIVILEGES;\n'
+}
+
+# prefixed_dbs_sql <cpanel_user>
+# cPanel prefixes every database with "<user>_". This matches that literal
+# prefix with SUBSTRING(...) = ..., never LIKE: in LIKE the underscore is a
+# wildcard and there is no boundary, so account "web" would also pick up
+# another account's "webshop_db".
+prefixed_dbs_sql() {
+  local user="$1"
+  printf "SELECT SCHEMA_NAME FROM information_schema.SCHEMATA WHERE SUBSTRING(SCHEMA_NAME,1,%d)='%s_';" \
+    $((${#user} + 1)) "$user"
+}
+
+# account_prefixed_dbs <source|target> <cpanel_user> — one database per line.
+account_prefixed_dbs() {
+  local role="$1" user="$2"
+  [[ "$user" =~ ^[A-Za-z0-9_-]+$ ]] || return 0
+  c_ssh "$role" "mysql -N -B -e \"$(prefixed_dbs_sql "$user")\" 2>/dev/null"
+}
+
+# db_charsets <source|target> <db>
+# The distinct REAL character sets of a database's tables (from each table's
+# own collation, not the schema default), space-separated.
+db_charsets() {
+  local role="$1" db="$2"
+  [[ "$db" =~ ^[A-Za-z0-9_-]+$ ]] || return 0
+  c_ssh "$role" "mysql -N -B -e \"SELECT DISTINCT c.character_set_name FROM information_schema.tables t JOIN information_schema.collation_character_set_applicability c ON c.collation_name = t.table_collation WHERE t.table_schema='${db}' AND t.table_type='BASE TABLE';\" 2>/dev/null" \
+    | tr '\n' ' ' | sed 's/ *$//'
+}
+
+# pick_dump_charset <space-separated list from db_charsets>
+# Chooses the client character set for mysqldump and the matching import.
+#   * exactly one charset  -> that charset. Dumping and importing in the
+#     tables' own charset moves the bytes untouched (this is what keeps a
+#     latin1-declared database that holds utf8 bytes intact).
+#   * utf8 / utf8mb3 / utf8mb4 / utf16 / ucs2 / utf32 -> utf8mb4, the
+#     superset, which is lossless for all of them.
+#   * several charsets, or none (empty database) -> utf8mb4.
+# The one thing this must never do is fall back to latin1 for a database
+# that is not latin1: latin1 cannot represent e.g. the Romanian letters
+# ă, ș and ț, and the server silently turns each of them into '?'.
+pick_dump_charset() {
+  local list="${1:-}" n
+  n=$(printf '%s' "$list" | wc -w | tr -d '[:space:]')
+  if [[ "$n" -ne 1 || ! "$list" =~ ^[a-z0-9_]+$ ]]; then
+    echo utf8mb4; return 0
+  fi
+  case "$list" in
+    utf8|utf8mb3|utf8mb4|utf16|utf16le|ucs2|utf32) echo utf8mb4 ;;
+    *) echo "$list" ;;
+  esac
+}
