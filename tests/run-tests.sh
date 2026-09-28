@@ -47,6 +47,9 @@ check() {
   fi
 }
 group() { printf '\n\033[1m%s\033[0m\n' "$1"; }
+# Removes ANSI colour codes. Uses a real ESC byte because BSD sed (macOS) does
+# not understand \x1b.
+strip_colors() { sed "s/$(printf '\033')\[[0-9;]*m//g"; }
 
 # ---------------------------------------------------------------------------
 group "Virtualmin --multiline parsing (leading whitespace tolerance)"
@@ -400,7 +403,7 @@ check "a rejected update is reported as a failure, not 'DNS updated'" "$(dns_run
 check "a hostname instead of an IPv4 is refused" "$(dns_run ok vmi123.contaboserver.net)" "1"
 check "...without calling the API at all" "$(wc -l < "$CURL_LOG" | tr -d ' ')" "0"
 check "_contabo_call surfaces the API's own message on failure" \
-  "$( ( curl() { printf '{"message":"quota exceeded"}\n429'; }; _contabo_call GET http://x tok 2>&1 >/dev/null ) | sed 's/\x1b\[[0-9;]*m//g' )" \
+  "$( ( curl() { printf '{"message":"quota exceeded"}\n429'; }; _contabo_call GET http://x tok 2>&1 >/dev/null ) | strip_colors )" \
   "[!!] Contabo API GET failed (HTTP 429): quota exceeded"
 
 # ---------------------------------------------------------------------------
@@ -417,7 +420,7 @@ check "an existing user's password is corrected (ALTER USER), not left as it was
 check "create_db_user sends the SQL on stdin" \
   "$( ( c_ssh_pipe() { cat > "$TMP/sent.sql"; }; create_db_user d u "pa'ss" >/dev/null 2>&1; grep -c "IDENTIFIED BY 'pa''ss'" "$TMP/sent.sql" ) )" "4"
 check "create_db_user refuses an empty password (no passwordless MySQL user)" \
-  "$( ( c_ssh_pipe() { cat > "$TMP/sent2.sql"; }; create_db_user d u '' >/dev/null 2>&1; rc=$?; echo "rc=$rc sent=$([[ -f "$TMP/sent2.sql" ]] && wc -c < "$TMP/sent2.sql" || echo 0)" ) | tr -s ' ' )" "rc=1 sent=0"
+  "$( ( c_ssh_pipe() { cat > "$TMP/sent2.sql"; }; create_db_user d u '' >/dev/null 2>&1; rc=$?; echo "rc=$rc sent=$([[ -f "$TMP/sent2.sql" ]] && wc -c < "$TMP/sent2.sql" | tr -d ' ' || echo 0)" ) )" "rc=1 sent=0"
 
 # ---------------------------------------------------------------------------
 group "Connection probe: password travels in MYSQL_PWD, never as an argument"
@@ -456,14 +459,17 @@ group "Database selection: one account never picks up another's databases"
 check "prefix SQL matches the literal '<user>_' prefix" \
   "$(prefixed_dbs_sql web)" "SELECT SCHEMA_NAME FROM information_schema.SCHEMATA WHERE SUBSTRING(SCHEMA_NAME,1,4)='web_';"
 check "prefix SQL does not use LIKE (where _ is a wildcard)" "$(prefixed_dbs_sql web | grep -ci 'like' | tr -d ' ')" "0"
-PD_OUT=$( (
+# The stubs live in a function, not inside $( ), because bash 3.2 (stock macOS)
+# cannot parse a `case` statement nested inside a command substitution.
+pd_run() (
   discover_app_db_credentials() { printf 'web_wp\tweb_user\tpw\n'; }
   c_ssh() { case "$*" in *SUBSTRING*) printf 'web_wp\nweb_shop\n' ;; *"SCHEMA_NAME='web_wp'"*) echo web_wp ;; esac; }
   migrate_one_database() { echo "MIGRATED:$2" >> "$TMP/migrated.log"; }
   : > "$TMP/migrated.log"
-  phase_migrate_database example.com web web 2>&1 | sed 's/\x1b\[[0-9;]*m//g' | grep -c 'web_shop'
-  cat "$TMP/migrated.log" | tr '\n' ','
-) )
+  phase_migrate_database example.com web web 2>&1 | strip_colors | grep -c 'web_shop'
+  tr '\n' ',' < "$TMP/migrated.log"
+)
+PD_OUT=$(pd_run)
 check "an extra database is named in a warning, not silently left behind" "$(printf '%s' "$PD_OUT" | head -1)" "1"
 check "only the app's own database is migrated" "$(printf '%s' "$PD_OUT" | tail -1)" "MIGRATED:web_wp,"
 
