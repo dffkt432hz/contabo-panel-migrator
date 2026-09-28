@@ -6,6 +6,13 @@ of these are already worked around in the code (see the comment right
 above the relevant function) — this page exists for the ones you'll still
 hit yourself, and to explain *why* the code does what it does.
 
+## Starting up
+
+**`Failed to load lib/audit-source.sh` (or `audit-target.sh`) and the wizard exits.**
+You are on the original 1.0.0 checkout, which shipped without those two
+files. `git pull` to get 1.0.1 or later. `tests/run-tests.sh` now fails if
+any library the wizard names is missing.
+
 ## SSH / connectivity
 
 **A loop over SSH calls only seems to process the first item.**
@@ -152,14 +159,55 @@ Check PHP resource limits before anything else. A source cPanel box's
 defaults (`memory_limit`, `upload_max_filesize`, `max_execution_time`,
 etc.) are commonly 8-128x more generous than a fresh PHP-FPM install's
 defaults, and hitting the new, lower limit produces an unlogged,
-OOM-flavoured 500 rather than a clear PHP error. Run
-`check_php_parity`/`fix_php_parity` from `lib/audit-target.sh`.
+OOM-flavoured 500 rather than a clear PHP error. The
+target audit checks this for you and offers to fix it. To run the check or
+the fix by hand, from the repository root (with your target details in
+`config/config.env`, and `AUDIT_DIR` pointing at the earlier run that
+recorded the source's limits):
+
+```
+for l in common audit-source audit-target; do source lib/$l.sh; done
+load_config
+export AUDIT_DIR=audit-YYYYMMDD-HHMMSS
+check_php_parity     # report only
+fix_php_parity       # raise limits (never lowers), restart php-fpm, re-verify
+```
+
+`fix_php_parity` writes one drop-in file, `99-panel-migrator-limits.ini`,
+next to the distro's own PHP config, so package upgrades cannot undo it.
+
+**The PHP fix ran but a site still hits the old limit.**
+The check reads the php *CLI*, and a per-pool PHP-FPM setting
+(`php_admin_value[memory_limit]` and friends in a pool file) overrides
+`php.ini` for that pool. `check_php_parity` lists any pool files that set
+their own values — edit those too. The source's limits are likewise read
+from its php CLI, so a per-domain MultiPHP override on the source is not
+visible to the audit.
 
 **A write fails with what looks like a permissions or syntax error.**
 Check disk quota first — `virtualmin list-domains --domain <domain>
 --multiline | grep -i quota`. A capped quota produces confusing failures
 in totally unrelated-looking commands (a `sed -i` on `.htaccess`, for
 example) well after the quota was actually exceeded by something else.
+
+**The audit reports addon/parked domains, but only the main domain migrated.**
+Correct, and deliberate: the pipeline migrates each account's main domain.
+Run it again for the addon domains (choose "a specific list of domains" at
+account selection), or migrate them by hand.
+
+**A long transfer stalls or the connection is refused partway through.**
+The source audit lists any security layer it finds (CSF, Imunify360,
+cPHulk, fail2ban). These rate-limit or ban a host that opens many SSH
+connections in a row, which is exactly what a transfer does. Whitelist the
+machine running the wizard on both servers before starting (for CSF:
+`csf -a <ip>`), and check you have not been banned if connections start
+being refused.
+
+**The target audit refuses to continue because of disk space.**
+It compares the source's real footprint (files and mail from `du`, plus
+the size of the databases being migrated) against the target's free space,
+with a 10% margin, and databases get extra room for import overhead. Free
+space or resize the VPS, then re-run; nothing has been copied yet.
 
 ## Virtualmin CLI quirks
 

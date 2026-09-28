@@ -25,6 +25,10 @@ trap 'rm -rf "$TMP"' EXIT
 source "$REPO_ROOT/lib/common.sh"
 # shellcheck source=../lib/contabo-api.sh
 source "$REPO_ROOT/lib/contabo-api.sh"
+# shellcheck source=../lib/audit-source.sh
+source "$REPO_ROOT/lib/audit-source.sh"
+# shellcheck source=../lib/audit-target.sh
+source "$REPO_ROOT/lib/audit-target.sh"
 # shellcheck source=../lib/migrate-account.sh
 source "$REPO_ROOT/lib/migrate-account.sh"
 # shellcheck source=../lib/sanity-check.sh
@@ -178,6 +182,147 @@ if grep -q 'table_rows' "$REPO_ROOT/lib/common.sh" | grep -qv '^#'; then
 else
   check "table_rows estimate not used in code" "not-used" "not-used"
 fi
+
+
+# ---------------------------------------------------------------------------
+group "Wiring: every library the wizard sources exists and loads"
+WIZ_LIBS=$(sed -n 's/^for _lib in \(.*\); do$/\1/p' "$REPO_ROOT/bin/migrate-wizard.sh")
+MISSING_LIBS=""
+for _l in $WIZ_LIBS; do [[ -f "$REPO_ROOT/lib/${_l}.sh" ]] || MISSING_LIBS+="${_l} "; done
+check "no library named by the wizard is missing" "${MISSING_LIBS:-none}" "none"
+check "wizard names the audit libraries" \
+  "$([[ " $WIZ_LIBS " == *" audit-source "* && " $WIZ_LIBS " == *" audit-target "* ]] && echo yes || echo no)" "yes"
+LOAD_OUT=$(bash -c '
+  export REPO_ROOT="'"$REPO_ROOT"'"
+  for l in '"$WIZ_LIBS"'; do source "$REPO_ROOT/lib/${l}.sh" || exit 1; done
+  for f in audit_source_full audit_target_full source_account_pairs check_php_parity fix_php_parity; do
+    type "$f" >/dev/null 2>&1 || { echo "undefined: $f"; exit 1; }
+  done
+  echo loaded' 2>&1)
+check "all wizard libraries load and define the functions the wizard calls" "$LOAD_OUT" "loaded"
+SYNTAX_BAD=""
+for _f in "$REPO_ROOT"/bin/*.sh "$REPO_ROOT"/lib/*.sh "$REPO_ROOT"/tests/run-tests.sh; do
+  bash -n "$_f" 2>/dev/null || SYNTAX_BAD+="$(basename "$_f") "
+done
+check "every script parses" "${SYNTAX_BAD:-none}" "none"
+
+# ---------------------------------------------------------------------------
+group "Repository hygiene: nothing credential-shaped is committed"
+CRED_HITS=$(grep -rEn 'BEGIN [A-Z ]*PRIVATE KEY|ghp_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,}|AKIA[0-9A-Z]{16}|xox[baprs]-[A-Za-z0-9-]{10,}' \
+  "$REPO_ROOT" --exclude-dir=.git 2>/dev/null | head -3)
+check "no private keys or API tokens in any file" "${CRED_HITS:-none}" "none"
+IP_HITS=$(grep -rEno '\b([0-9]{1,3}\.){3}[0-9]{1,3}\b' "$REPO_ROOT" --exclude-dir=.git 2>/dev/null \
+  | grep -vE ':(127\.0\.0\.1|0\.0\.0\.0|1\.1\.1\.1|1\.2\.3\.4|8\.8\.8\.8|192\.0\.2\.[0-9]+|198\.51\.100\.[0-9]+|203\.0\.113\.[0-9]+)$' \
+  | head -3)
+check "no real IP addresses (only well-known/documentation ones)" "${IP_HITS:-none}" "none"
+EXAMPLE_FILLED=$(grep -E '^[A-Z_]+=.+' "$REPO_ROOT/config/config.example.env" | grep -vE '^[A-Z_]+=(22|root)$' | head -3)
+check "config.example.env ships with every value blank" "${EXAMPLE_FILLED:-none}" "none"
+check ".gitignore keeps every real env file out" \
+  "$(grep -qF 'config/*.env' "$REPO_ROOT/.gitignore" && grep -qF '!config/config.example.env' "$REPO_ROOT/.gitignore" && echo yes || echo no)" "yes"
+
+# ---------------------------------------------------------------------------
+group "php.ini value comparison"
+check "256M in bytes"                  "$(ini_to_num 256M)"  "268435456"
+check "2G in bytes"                    "$(ini_to_num 2G)"    "2147483648"
+check "512K in bytes"                  "$(ini_to_num 512K)"  "524288"
+check "plain integer passes through"   "$(ini_to_num 300 max_execution_time)" "300"
+check "-1 means unlimited"             "$(ini_to_num -1 memory_limit)" "9999999999999"
+check "max_execution_time 0 = unlimited" "$(ini_to_num 0 max_execution_time)" "9999999999999"
+check "memory_limit 0 is not unlimited"  "$(ini_to_num 0 memory_limit)" "0"
+check "garbage yields nothing"         "$(ini_to_num 'lots')" ""
+check "unlimited outranks any finite limit" \
+  "$([[ "$(ini_to_num -1 memory_limit)" -gt "$(ini_to_num 4G memory_limit)" ]] && echo yes || echo no)" "yes"
+
+# ---------------------------------------------------------------------------
+group "Disk headroom"
+check "fits with margin"        "$(disk_headroom_ok 1000 1200 && echo yes || echo no)" "yes"
+check "exact fit fails margin"  "$(disk_headroom_ok 1000 1000 && echo yes || echo no)" "no"
+check "non-numeric is refused"  "$(disk_headroom_ok abc 1000 && echo yes || echo no)" "no"
+
+# ---------------------------------------------------------------------------
+group "Source discovery"
+# These override the fixture paths read by lib/audit-source.sh, which is sourced above.
+# shellcheck disable=SC2034
+mkdir -p "$TMP/src" "$TMP/src/users" "$TMP/src/valiases"
+printf 'example.com: alice\nshop.example.org: bob\norphan.example.net: nobody\nsys.example.io: root\n' > "$TMP/src/trueuserdomains"
+SRC_TRUEUSERDOMAINS_FILE="$TMP/src/trueuserdomains"
+check "account pairs skip root/nobody and are sorted" \
+  "$(source_account_pairs | tr '\n' ',')" "example.com alice,shop.example.org bob,"
+
+printf 'DNS=fallback.example.com\nUSER=carol\n' > "$TMP/src/users/carol"
+printf 'DNS=ignored.example.com\n' > "$TMP/src/users/root"
+SRC_TRUEUSERDOMAINS_FILE="$TMP/src/does-not-exist"
+# shellcheck disable=SC2034
+SRC_CPANEL_USERS_DIR="$TMP/src/users"
+check "falls back to /var/cpanel/users when trueuserdomains is absent" \
+  "$(source_account_pairs | tr '\n' ',')" "fallback.example.com carol,"
+# shellcheck disable=SC2034
+SRC_TRUEUSERDOMAINS_FILE="$TMP/src/trueuserdomains"
+
+printf 'alice.example.com: alice==root==addon==example.com==/home/alice/a==x==y\nex.com: alice==root==main==ex.com==/home/alice/public_html==x==y\nbob.example.com: bob==root==addon==shop.example.org==/home/bob/a==x==y\n' > "$TMP/src/userdatadomains"
+# shellcheck disable=SC2034
+SRC_USERDATADOMAINS_FILE="$TMP/src/userdatadomains"
+check "addon domains are listed for the right account only" \
+  "$(source_extra_domains alice | tr -d '[:space:]')" "alice.example.com"
+
+printf '*: :fail: No Such User Here\n' > "$TMP/src/valiases/example.com"
+printf '*: catchall@shop.example.org\ninfo: real@shop.example.org\n' > "$TMP/src/valiases/shop.example.org"
+# shellcheck disable=SC2034
+SRC_VALIASES_DIR="$TMP/src/valiases"
+check "default reject is not a catch-all" "$(classify_catchall "$(detect_catchall example.com)")" "none"
+check "a real catch-all is reported with its destination" \
+  "$(classify_catchall "$(detect_catchall shop.example.org)")" "forward:catchall@shop.example.org"
+check "blackhole is not a catch-all" "$(classify_catchall ':blackhole:')" "none"
+check "no valiases file -> none" "$(classify_catchall "$(detect_catchall missing.example.com)")" "none"
+
+mkdir -p "$TMP/plat/wp" "$TMP/plat/lara/public" "$TMP/plat/joom" "$TMP/plat/php" "$TMP/plat/static" "$TMP/plat/empty"
+: > "$TMP/plat/wp/wp-config.php"
+: > "$TMP/plat/lara/artisan"
+printf '<?php class JConfig {}\n' > "$TMP/plat/joom/configuration.php"
+: > "$TMP/plat/php/index.php"
+: > "$TMP/plat/static/index.html"
+check "platform: WordPress"          "$(detect_platform "$TMP/plat/wp")"            "WordPress"
+check "platform: Laravel (artisan one level above public/)" "$(detect_platform "$TMP/plat/lara/public")" "Laravel"
+check "platform: Joomla"             "$(detect_platform "$TMP/plat/joom")"          "Joomla"
+check "platform: generic PHP"        "$(detect_platform "$TMP/plat/php")"           "PHP"
+check "platform: static"             "$(detect_platform "$TMP/plat/static")"        "static"
+check "platform: unknown"            "$(detect_platform "$TMP/plat/empty")"         "unknown"
+
+# ---------------------------------------------------------------------------
+group "PHP parity check and fix"
+export AUDIT_DIR="$TMP/audit"
+printf 'memory_limit=512M\nupload_max_filesize=128M\nmax_execution_time=300\n' > "$AUDIT_DIR/source-php-limits.env"
+
+check "lower target limits are flagged" \
+  "$( ( php_limits_of() { printf 'memory_limit=128M\nupload_max_filesize=128M\nmax_execution_time=300\n'; }; check_php_parity >/dev/null 2>&1; echo $? ) )" "1"
+check "equal limits pass" \
+  "$( ( php_limits_of() { printf 'memory_limit=512M\nupload_max_filesize=128M\nmax_execution_time=300\n'; }; check_php_parity >/dev/null 2>&1; echo $? ) )" "0"
+check "higher target limits pass (never asks to lower anything)" \
+  "$( ( php_limits_of() { printf 'memory_limit=2G\nupload_max_filesize=1G\nmax_execution_time=0\n'; }; check_php_parity >/dev/null 2>&1; echo $? ) )" "0"
+check "unlimited (-1) on the target passes" \
+  "$( ( php_limits_of() { printf 'memory_limit=-1\nupload_max_filesize=128M\nmax_execution_time=300\n'; }; check_php_parity >/dev/null 2>&1; echo $? ) )" "0"
+check "an unreadable target is a failure, not a silent pass" \
+  "$( ( php_limits_of() { :; }; check_php_parity >/dev/null 2>&1; echo $? ) )" "1"
+
+mkdir -p "$TMP/phpd/a" "$TMP/phpd/b"
+DROP="$TMP/phpd/a/${TARGET_PHP_INI_NAME}"
+FIX_OUT=$( (
+  TARGET_PHP_INI_DIRS="$TMP/phpd/a $TMP/phpd/b"
+  php_limits_of() {
+    if [[ -f "$DROP" ]]; then sed 's/ *= */=/' "$DROP"; else printf 'memory_limit=128M\nupload_max_filesize=2M\nmax_execution_time=30\n'; fi
+  }
+  fix_php_parity >/dev/null 2>&1; echo "rc=$?"
+  fix_php_parity >/dev/null 2>&1; echo "second-rc=$?"
+) )
+check "fix_php_parity raises the limits and re-verifies (rc 0)" "$(printf '%s' "$FIX_OUT" | sed -n 's/^rc=//p')" "0"
+check "drop-in has the raised values" "$(tr -d ' ' < "$DROP" | tr '\n' ',')" "memory_limit=512M,upload_max_filesize=128M,max_execution_time=300,"
+check "drop-in written to every configured directory" "$([[ -f "$TMP/phpd/b/${TARGET_PHP_INI_NAME}" ]] && echo yes || echo no)" "yes"
+check "running the fix again is a no-op and stays successful" "$(printf '%s' "$FIX_OUT" | sed -n 's/^second-rc=//p')" "0"
+check "no backup clutter when nothing changed" "$(compgen -G "$TMP/phpd/a/*.bak.*" | wc -l | tr -d '[:space:]')" "0"
+check "fix refuses to run with no recorded source limits" \
+  "$( ( AUDIT_DIR="$TMP/empty-audit"; mkdir -p "$AUDIT_DIR"; fix_php_parity >/dev/null 2>&1; echo $? ) )" "1"
+check "fix reports failure when no PHP config directory exists" \
+  "$( ( export TARGET_PHP_INI_DIRS="$TMP/nowhere/*"; php_limits_of() { printf 'memory_limit=128M\n'; }; fix_php_parity >/dev/null 2>&1; echo $? ) )" "1"
 
 # ---------------------------------------------------------------------------
 printf '\n\033[1mResult:\033[0m %d passed, %d failed\n' "$PASS" "$FAIL"

@@ -1,0 +1,33 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: tests (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v4
+
+      # Run the suite under the OS's own /bin/bash. On macOS that is bash 3.2,
+      # which is what the README's "bash 3.2+" claim rests on.
+      - name: Offline test suite (system bash)
+        run: /bin/bash tests/run-tests.sh
+
+  shellcheck:
+    name: shellcheck
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: ShellCheck (warnings and above)
+        run: shellcheck -x -S warning -e SC1090,SC1091 bin/*.sh lib/*.sh tests/run-tests.sh tests/mock-ssh/ssh

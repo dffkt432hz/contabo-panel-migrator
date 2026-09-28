@@ -262,3 +262,91 @@ db_total_rows() {
   [[ -z "$inner" || "$inner" == "NULL" ]] && { echo 0; return; }
   c_ssh "$role" "mysql -N -B -e \"SELECT COALESCE(SUM(c),0) FROM (${inner}) x;\"" 2>/dev/null | tr -d '[:space:]'
 }
+
+# ---------------------------------------------------------------------------
+# Audit helpers (shared by lib/audit-source.sh and lib/audit-target.sh)
+# ---------------------------------------------------------------------------
+# Every remote probe below goes through remote_script, so nothing in them is
+# ever exposed to nested-quoting problems. All of them are strictly read-only.
+
+# remote_missing_tools <source|target> <tool>...
+# Prints, space-separated, whichever of the named commands are NOT installed
+# on the remote host. Empty output means everything is present.
+remote_missing_tools() {
+  local role="$1"; shift
+  [[ $# -gt 0 ]] || return 0
+  remote_script "$role" "$@" <<'SCRIPT_EOF'
+for t in "$@"; do
+  command -v "$t" >/dev/null 2>&1 || printf '%s ' "$t"
+done
+exit 0
+SCRIPT_EOF
+}
+
+# detect_security_stack <source|target>
+# Prints the names of any host-security layers found, space-separated. These
+# matter for a migration because several of them (CSF, Imunify360, cPHulk,
+# fail2ban) will happily rate-limit or ban the machine running the wizard
+# in the middle of a large transfer.
+detect_security_stack() {
+  remote_script "$1" <<'SCRIPT_EOF'
+found=""
+add() { found="$found $1"; }
+if [ -x /usr/sbin/csf ] || [ -f /etc/csf/csf.conf ]; then add CSF; fi
+if command -v imunify360-agent >/dev/null 2>&1 || [ -x /usr/bin/imunify360-agent ]; then add Imunify360; fi
+if [ -e /var/cpanel/hulkd/enabled ]; then add cPHulk; fi
+if [ -d /etc/apache2/conf.d/modsec ] || [ -f /etc/apache2/conf.d/modsec2.conf ] \
+   || [ -f /usr/local/apache/conf/modsec2.conf ] \
+   || ls /etc/httpd/conf.d/*security2* >/dev/null 2>&1 \
+   || [ -e /etc/apache2/mods-enabled/security2.load ]; then add ModSecurity; fi
+if command -v fail2ban-client >/dev/null 2>&1; then add fail2ban; fi
+if command -v clamscan >/dev/null 2>&1 || [ -x /usr/local/cpanel/3rdparty/bin/clamscan ]; then add ClamAV; fi
+echo "${found# }"
+SCRIPT_EOF
+}
+
+# php_limits_of <source|target>
+# Prints key=value lines for the PHP resource limits that most often differ
+# between a cPanel box and a fresh PHP-FPM install. Read from the php CLI;
+# a per-domain override (MultiPHP INI editor, a pool file) is NOT visible here.
+php_limits_of() {
+  remote_script "$1" <<'SCRIPT_EOF'
+for k in memory_limit upload_max_filesize post_max_size max_execution_time max_input_vars; do
+  v=$(php -r "echo ini_get('$k');" 2>/dev/null </dev/null)
+  if [ -n "$v" ]; then printf '%s=%s\n' "$k" "$v"; fi
+done
+exit 0
+SCRIPT_EOF
+}
+
+# ini_to_num <value> [key]
+# Converts a php.ini value to a plain integer so two values can be compared:
+# "256M" -> bytes, "-1" (and max_execution_time=0) -> a huge number meaning
+# "unlimited". Prints nothing for anything unparseable.
+ini_to_num() {
+  local v="${1:-}" key="${2:-}" n suffix
+  v="${v//[[:space:]]/}"
+  [[ -z "$v" ]] && return 0
+  if [[ "$v" == "-1" || ( "$key" == "max_execution_time" && "$v" == "0" ) ]]; then
+    echo 9999999999999
+    return 0
+  fi
+  if [[ "$v" =~ ^([0-9]+)([KkMmGg]?)$ ]]; then
+    n="${BASH_REMATCH[1]}"
+    suffix="${BASH_REMATCH[2]}"
+    case "$suffix" in
+      K|k) echo $((n * 1024)) ;;
+      M|m) echo $((n * 1024 * 1024)) ;;
+      G|g) echo $((n * 1024 * 1024 * 1024)) ;;
+      *)   echo "$n" ;;
+    esac
+  fi
+}
+
+# disk_headroom_ok <needed_kb> <free_kb> [percent_margin=10]
+# True when free space covers the need plus a safety margin.
+disk_headroom_ok() {
+  local need="${1:-0}" free="${2:-0}" margin="${3:-10}"
+  [[ "$need" =~ ^[0-9]+$ && "$free" =~ ^[0-9]+$ ]] || return 1
+  [[ $((need * (100 + margin) / 100)) -le "$free" ]]
+}

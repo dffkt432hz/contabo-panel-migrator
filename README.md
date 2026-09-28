@@ -5,8 +5,7 @@
 ![source](https://img.shields.io/badge/source-cPanel%20%2F%20WHM-FF6C2C)
 ![target](https://img.shields.io/badge/target-Virtualmin%20%2F%20Webmin-7952B3)
 ![license](https://img.shields.io/badge/license-MIT-yellow)
-![tests](https://img.shields.io/badge/tests-28%20passing-brightgreen)
-![shellcheck](https://img.shields.io/badge/shellcheck-clean-brightgreen)
+[![CI](https://github.com/dffkt432hz/contabo-panel-migrator/actions/workflows/ci.yml/badge.svg)](https://github.com/dffkt432hz/contabo-panel-migrator/actions/workflows/ci.yml)
 
 **Move an entire cPanel server to Webmin + LAMP without losing a single mailbox.**
 
@@ -37,16 +36,21 @@ automatically, every time.
 
 ## What it actually does
 
-1. **Scans the source server** — every real cPanel account, what
+1. **Scans the source server** (read-only) — every real cPanel account, what
    platform each site runs (WordPress, Laravel, Joomla, generic PHP,
    static), its real database(s) and their actual per-table charset, its
    real mailboxes (not the account name — the *real* addresses), any
-   catch-all routing already configured, and what security layers
-   (CSF, Imunify360, ModSecurity, fail2ban) are active.
-2. **Audits the target server** — confirms the right panel is actually
-   installed and usable, checks PHP resource limits against safe
-   defaults, checks for a quota cap that would silently truncate a large
-   transfer.
+   catch-all routing already configured, addon/parked domains the
+   pipeline will *not* cover, total size, PHP limits, and what security
+   layers (CSF, Imunify360, cPHulk, ModSecurity, fail2ban, ClamAV) could
+   interfere with a long transfer. The per-account inventory is saved to
+   the run's `audit-*/` directory.
+2. **Audits the target server** — confirms Webmin/Virtualmin is actually
+   installed and its services are running, checks that the tools the
+   pipeline needs are present, compares the target's PHP limits with the
+   source's (and offers a one-step, non-lowering fix), flags a quota cap
+   that would silently truncate a large transfer, and checks free disk
+   against the source's real footprint before anything is copied.
 3. **Migrates everything, per account, in the order that works** —
    domain creation, file transfer, database import, SSH deploy-key
    install, full mailbox migration (password + real message content),
@@ -76,7 +80,7 @@ time.
 ## Quick start
 
 ```bash
-git clone https://github.com/<your-org>/contabo-panel-migrator.git
+git clone https://github.com/dffkt432hz/contabo-panel-migrator.git
 cd contabo-panel-migrator
 cp config/config.example.env config/config.env   # optional — pre-fill what you already know
 bin/migrate-wizard.sh
@@ -110,6 +114,10 @@ each path actually automates.
 
 ## Safety notes
 
+- Both audits are read-only. The only thing before the migration itself
+  that can change a server is the optional PHP-limits fix, which asks
+  first, only ever *raises* a limit, writes one separate drop-in file
+  (never the distro's `php.ini`), and reads the values back to confirm.
 - Every SSH command is fully scripted and logged — nothing is run
   interactively "by feel."
 - File transfers never go directly server-to-server; they're always
@@ -123,9 +131,19 @@ each path actually automates.
   take after your own monitoring window — not something a script decides
   for you.
 
+## Credentials and security
+
+This repository contains no credentials, keys, or server addresses, and
+the test suite fails if one ever sneaks in. Real configuration
+(`config/*.env`) and every run's output (`audit-*/`, which includes the
+passwords generated for new domains) are git-ignored. Contabo secrets are
+read without echo; database passwords are never printed or recorded by the
+audit. Details, and what to do if you commit a secret by accident, are in
+[`SECURITY.md`](https://github.com/dffkt432hz/contabo-panel-migrator/blob/main/SECURITY.md).
+
 ## Tests
 
-```bash
+```
 tests/run-tests.sh
 ```
 
@@ -134,9 +152,13 @@ mock `ssh` that runs commands locally, so the real wrappers are tested
 rather than stubbed out. The suite covers the failure modes that are
 hardest to spot by reading the code: stdin handling around SSH (a loop
 that silently processes one item; a database import that silently imports
-nothing), config parsers against passwords containing `$`, `"`, `` ` ``,
-`'` and `*`, counters that reset inside subshells, and API parsing given
-malformed or error responses.
+nothing), config parsers against passwords containing `$`, `"`, `` ` ``, `'` and `*`, counters that reset inside subshells, and API parsing given
+malformed or error responses. It also checks that every library the wizard
+loads exists and defines what the wizard calls, that source discovery
+(accounts, platforms, catch-alls, addon domains) and the PHP-limits
+check/fix behave correctly, and that nothing credential-shaped is committed.
+
+CI runs the suite on Linux and on macOS's stock bash 3.2, plus ShellCheck.
 
 ## Repository layout
 
@@ -144,8 +166,8 @@ malformed or error responses.
 bin/migrate-wizard.sh     — interactive entrypoint, start here
 lib/common.sh             — SSH wrappers, logging, config loading
 lib/contabo-api.sh        — Contabo DNS API (auth, upsert, SPF-preserving update)
-lib/audit-source.sh       — source server scan (accounts, platform, DB, mail, security)
-lib/audit-target.sh       — target server scan (panel, PHP limits, quota, security)
+lib/audit-source.sh       — read-only source scan (accounts, platform, DB, mail, size, PHP, security)
+lib/audit-target.sh       — target readiness (panel, tools, PHP parity + fix, quota, disk, security)
 lib/migrate-account.sh    — the actual per-account migration pipeline
 lib/dns-cutover.sh        — DNS cutover + certificate issuance, in the right order
 lib/sanity-check.sh       — post-migration verification + suggested fixes
@@ -154,6 +176,8 @@ docs/ARCHITECTURE.md      — how it fits together and why
 docs/TROUBLESHOOTING.md   — every real failure mode hit building this, and its fix
 docs/SUPPORTED-SCENARIOS.md — which source/target combos are automated vs. manual
 tests/run-tests.sh        — offline test suite (no servers required)
+.github/workflows/ci.yml  — tests on Linux + macOS bash 3.2, and ShellCheck
+SECURITY.md               — reporting, credential handling, what to do after a leak
 ```
 
 ## Compatibility

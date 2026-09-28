@@ -24,8 +24,12 @@ scope — this toolkit assumes a POSIX shell and SSH on both ends.
 
 ## What "fully automated" actually means
 
-Even in the fully-automated cPanel -> Virtualmin path, three things are
+Even in the fully-automated cPanel -> Virtualmin path, four things are
 explicitly *not* automated, on purpose:
+
+- **Addon and parked domains.** The pipeline migrates each account's *main*
+  domain. The source audit lists any addon/parked domains it finds on each
+  account (so nothing is a surprise), but they need their own run.
 
 - **DNS records other than A/www/SPF/DKIM** (MX, NS, SOA, DMARC, and any
   site-verification TXT records) are left untouched. Touching MX/NS

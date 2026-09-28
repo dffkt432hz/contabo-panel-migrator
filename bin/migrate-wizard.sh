@@ -204,7 +204,10 @@ MENU
 
 step_audit() {
   section "Step 7 — Audit"
-  audit_source_full
+  if ! audit_source_full; then
+    err "The source server has problems that block an automated migration (see above)."
+    exit 1
+  fi
 
   if ! audit_target_full; then
     err "The target server is not ready for an automated migration (see above)."

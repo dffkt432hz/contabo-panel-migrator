@@ -29,8 +29,8 @@ flowchart TD
     B --> C[Step 3: connection details + reachability test]
     C --> D[Step 4-5: deploy key + Contabo API credentials]
     D --> E[Step 6: account selection]
-    E --> F[audit-source.sh: platform/DB/mail/security scan]
-    F --> G[audit-target.sh: panel/PHP/quota/security scan]
+    E --> F[audit-source.sh: read-only scan: accounts, platform, DB, mail, size, PHP, security]
+    F --> G[audit-target.sh: panel, tools, PHP parity, quota, disk, security]
     G --> H{Proceed?}
     H -- no --> Z[Stop, nothing changed]
     H -- yes --> I[migrate-account.sh, per account]
@@ -85,18 +85,54 @@ A migration that only does the first half looks completely successful
 behind. This toolkit always does both, and verifies message counts on both
 sides rather than trusting "no error" as proof of a complete transfer.
 
+## What the audits produce
+
+Both audits run before anything is copied, and the second consumes what the
+first learned:
+
+| Produced by | Where | Used by |
+|---|---|---|
+| `audit_source_full` | `SOURCE_ACCOUNT_COUNT`, `SOURCE_TOTAL_KB`, `SOURCE_DB_KB` (shell variables) | `check_target_disk` compares them with the target's free space |
+| `audit_source_full` | `audit-*/source-accounts.tsv` (domain, user, platform, database, charset, mailbox count, catch-all, size) | the operator; never contains a password |
+| `audit_source_full` | `audit-*/source-php-limits.env` | `check_php_parity` / `fix_php_parity` on the target |
+| `audit_target_full` | `TARGET_PANEL` (`virtualmin` \| `webmin` \| `cpanel` \| `none`) | `migrate-account.sh` and `sanity-check.sh` gate Virtualmin-only steps on it |
+
+`audit_source_full` returns non-zero (and the wizard stops) if the source is
+missing a tool the pipeline needs or has no accounts; `audit_target_full`
+returns non-zero if there is no usable Webmin/Virtualmin, a required tool is
+missing, or the target lacks room for the source's real footprint. Because
+the results are shell variables, the wizard must call both functions
+directly — never inside a pipe or `$(...)`, which would discard them.
+
+## How secrets move through the toolkit
+
+- Contabo credentials are prompted for without echo, or read from a
+  git-ignored `config/*.env`. They live in environment variables for the
+  duration of the run and are never written to the audit directory.
+- A site's database password is read from that site's own config file,
+  used once to recreate the database user on the target, and never printed
+  or logged by the audit.
+- Passwords generated for new domains go to
+  `audit-*/generated-passwords.tsv` (mode 600, in a 700 directory).
+- Everything above is git-ignored, and the offline test suite scans the
+  tracked files for private keys, API tokens and real IP addresses.
+
 ## Extending to other source panels
 
 `lib/audit-source.sh`'s account/domain/mailbox discovery currently assumes
-cPanel (`/var/cpanel/users`, `uapi Email list_pops`, `/etc/valiases`). To
-support another source panel (Plesk, DirectAdmin, a bare LAMP box), you
-only need to reimplement:
+cPanel (`/etc/trueuserdomains`, `uapi Email list_pops`, `/etc/valiases`,
+`/etc/userdatadomains`). To support another source panel (Plesk,
+DirectAdmin, a bare LAMP box), you only need to reimplement:
 
-- account + real-domain discovery (equivalent of `audit_source_accounts`'s
-  domain lookup)
-- mailbox discovery (equivalent of `detect_mailboxes`)
+- account + real-domain discovery (`source_account_pairs`, and
+  `source_extra_domains` for addon domains)
+- mailbox discovery (`detect_mailboxes`) and catch-all discovery
+  (`detect_catchall`)
 - the mailbox password-hash and Maildir *paths* used in
   `phase_migrate_mail` (`lib/migrate-account.sh`)
 
 Everything else — platform detection, database migration, file transfer,
-DNS cutover, sanity checks — is already panel-agnostic.
+DNS cutover, sanity checks — is already panel-agnostic. The path overrides
+at the top of `audit-source.sh` (`SRC_TRUEUSERDOMAINS_FILE` and friends)
+also let you point discovery at a fixture tree, which is how the tests
+exercise it.

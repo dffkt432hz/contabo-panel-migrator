@@ -1,10 +1,24 @@
-# Never commit real credentials or generated migration artifacts
-config/config.env
+# Never commit real credentials or generated migration artifacts.
+# Any env file under config/ is ignored; only the blank example is tracked.
+config/*.env
+!config/config.example.env
+.env
+.env.*
+!.env.example
+
+# Per-run output: account inventories, generated passwords, findings
 audit-*/
+generated-passwords.tsv
+source-accounts.tsv
+source-php-limits.env
+sanity-findings.txt
+
+# Keys and logs
 *.log
 *.pem
 *.key
-!config/config.example.env
+id_rsa*
+id_ed25519*
 
 # OS/editor noise
 .DS_Store
